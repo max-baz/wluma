@@ -44,6 +44,7 @@ Use one of the available packages and methods below:
 - Alpine Linux: [wluma](https://pkgs.alpinelinux.org/packages?name=wluma)
 - Arch Linux: [wluma](https://aur.archlinux.org/packages/wluma/) or [wluma-git](https://aur.archlinux.org/packages/wluma-git/)
 - NixOS: [wluma](https://search.nixos.org/packages?channel=unstable&show=wluma&from=0&size=50&sort=relevance&type=packages&query=wluma)
+- Fedora Linux: [wluma](https://github.com/terrapkg/packages/tree/frawhide/anda/system/wluma) via the [Terra repository](https://terra.fyralabs.com/)
 - Build the app yourself using the instructions below and copy the resulting binary somewhere in your `$PATH`.
   - optionally, grab the `wluma.service` if you want to run it as a systemd-service - it can be placed e.g. in `~/.config/systemd/user/`.
   - you might need `90-wluma-backlight.rules` too, if you want to give `wluma` direct driver access for the fastest performance (see "Permissions" section below) - it can be placed e.g. in `/etc/udev/rules.d/`.
