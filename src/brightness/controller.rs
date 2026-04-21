@@ -8,8 +8,6 @@ use std::thread;
 use std::time::Duration;
 
 const TRANSITION_MAX_MS: u64 = 200;
-const TRANSITION_STEP_MS: u64 = 1;
-const WAITING_SLEEP_MS: u64 = 100;
 
 pub struct Controller {
     brightness: Brightness,
@@ -77,7 +75,7 @@ impl Controller {
 
         // 4. nothing to do, sleep and check again
         // TODO: replace with inotify events on brightness device file and avoid sleep loop
-        Timer::after(Duration::from_millis(WAITING_SLEEP_MS)).await;
+        Timer::after(Duration::from_millis(self.brightness.waiting_sleep_ms())).await;
     }
 
     async fn update_current(&mut self, new_brightness: u64) {
@@ -94,10 +92,13 @@ impl Controller {
             (Some(old_target), _) if old_target.desired == desired => (),
             (_, Some(current)) if desired == current => (),
             (_, Some(current)) => {
+                let max_transition_steps = TRANSITION_MAX_MS
+                    .div_ceil(self.brightness.transition_step_ms())
+                    .max(1);
                 let step = if desired > current {
-                    (desired - current).div_ceil(TRANSITION_MAX_MS) as i64
+                    (desired - current).div_ceil(max_transition_steps) as i64
                 } else {
-                    -((current - desired).div_ceil(TRANSITION_MAX_MS) as i64)
+                    -((current - desired).div_ceil(max_transition_steps) as i64)
                 };
                 self.target = Some(Target { desired, step });
             }
@@ -125,7 +126,7 @@ impl Controller {
                             err
                         ),
                     };
-                    thread::sleep(Duration::from_millis(TRANSITION_STEP_MS));
+                    thread::sleep(Duration::from_millis(self.brightness.transition_step_ms()));
                 }
             }
             _ => unreachable!("Current and target values cannot be None at this point"),

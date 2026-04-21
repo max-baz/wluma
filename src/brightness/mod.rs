@@ -42,4 +42,24 @@ impl Brightness {
             }
         }
     }
+
+    pub fn transition_step_ms(&self) -> u64 {
+        match self {
+            Brightness::DdcUtil(b) => b.transition_step_ms(),
+            Brightness::Backlight(_) => 1,
+
+            #[cfg(test)]
+            Brightness::Mock { .. } => 1,
+        }
+    }
+
+    pub fn waiting_sleep_ms(&self) -> u64 {
+        match self {
+            Brightness::DdcUtil(b) => b.waiting_sleep_ms(),
+            Brightness::Backlight(_) => 100,
+
+            #[cfg(test)]
+            Brightness::Mock { .. } => 100,
+        }
+    }
 }
