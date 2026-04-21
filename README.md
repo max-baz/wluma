@@ -79,9 +79,11 @@ Each of them contains a `thresholds` field, which comes with good default values
 
 Multiple outputs are supported, using `backlight` (common for internal laptop screens) and `ddcutil` (for external screens). DDC is known to often be problematic, always consider trying out [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
 
-Each output is identified by compositor using model, manufacturer and serial number (e.g.`eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`.
+When `capturer="wayland"` is used, wluma matches compositor outputs by their model, manufacturer and serial number (e.g.`eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`).
 
-The `name` field in the output config will be matched as a substring, so you are free to put simply `eDP-1`, or a serial number (if you have two identical external screens). It is your responsibility to make sure that the values you use match **uniquely** to one output only.
+The `name` field in the output config identifies the Wayland output and the predictor data. It is matched as a substring against Wayland output descriptions, so you are free to put simply `eDP-1`, `HDMI-A-3`, or a unique model/serial substring. It is your responsibility to make sure that the values you use match **uniquely** to one output only.
+
+For `output.ddcutil`, if the identifier that works for brightness control is not the same substring that your Wayland compositor exposes for screen capture, set `identifier`. This is common for external DDC monitors: `name` should match the compositor output description such as `HDMI-A-3` or `LG ULTRAWIDE`, while `identifier` may need to be a serial number for DDC.
 
 _Tip:_ run `wluma` with `RUST_LOG=debug` to see how your outputs are being identified, so that you can choose an appropriate `name` configuration value.
 

@@ -63,6 +63,7 @@ pub struct BacklightOutput {
 #[derive(Deserialize, Debug)]
 pub struct DdcUtilOutput {
     pub name: String,
+    pub identifier: Option<String>,
     pub capturer: Option<Capturer>,
     pub predictor: Option<Predictor>,
 }

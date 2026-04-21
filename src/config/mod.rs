@@ -58,13 +58,17 @@ fn parse() -> Result<app::Config, toml::de::Error> {
         .and_then(|cfg_path| fs::read_to_string(cfg_path).ok())
         .unwrap_or_else(|| include_str!("../../config.toml").to_string());
 
+    parse_config_str(&file_config)
+}
+
+fn parse_config_str(file_config: &str) -> Result<app::Config, toml::de::Error> {
     let parse_als_thresholds = |t: HashMap<String, String>| -> HashMap<u64, String> {
         t.into_iter()
             .map(|(k, v)| (k.parse().unwrap(), v))
             .collect()
     };
 
-    toml::from_str(&file_config).map(|file_config: file::Config| app::Config {
+    toml::from_str(file_config).map(|file_config: file::Config| app::Config {
         output: file_config
             .output
             .backlight
@@ -79,8 +83,10 @@ fn parse() -> Result<app::Config, toml::de::Error> {
                 })
             })
             .chain(file_config.output.ddcutil.into_iter().map(|o| {
+                let identifier = o.identifier.clone().unwrap_or_else(|| o.name.clone());
                 app::Output::DdcUtil(app::DdcUtilOutput {
                     name: o.name,
+                    identifier,
                     min_brightness: 1,
                     capturer: match_capturer(o.capturer.unwrap_or_default()),
                     predictor: match_predictor(o.predictor.unwrap_or_default()),
@@ -128,5 +134,79 @@ fn validate(config: app::Config) -> Result<app::Config> {
         (0, _) => Err(anyhow!("No output or keyboard configured")),
         (_, false) => Err(anyhow!("Names of all outputs and keyboards are not unique")),
         _ => Ok(config),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ddc_identifier_defaults_to_output_name() {
+        let config = parse_config_str(
+            r#"
+[als.none]
+
+[[output.backlight]]
+name = "panel"
+path = "/sys/class/backlight/panel"
+capturer = "none"
+
+[[output.ddcutil]]
+name = "HDMI-A-3"
+capturer = "none"
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::Backlight(output) => {
+                assert_eq!("panel", output.name);
+            }
+            _ => unreachable!(),
+        }
+
+        match &config.output[1] {
+            app::Output::DdcUtil(output) => {
+                assert_eq!("HDMI-A-3", output.name);
+                assert_eq!("HDMI-A-3", output.identifier);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_ddc_identifier_can_be_configured_separately() {
+        let config = parse_config_str(
+            r#"
+[als.none]
+
+[[output.backlight]]
+name = "panel"
+path = "/sys/class/backlight/panel"
+capturer = "none"
+
+[[output.ddcutil]]
+name = "HDMI-A-3"
+identifier = "serial-123"
+capturer = "none"
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::Backlight(output) => {
+                assert_eq!("panel", output.name);
+            }
+            _ => unreachable!(),
+        }
+
+        match &config.output[1] {
+            app::Output::DdcUtil(output) => {
+                assert_eq!("HDMI-A-3", output.name);
+                assert_eq!("serial-123", output.identifier);
+            }
+            _ => unreachable!(),
+        }
     }
 }

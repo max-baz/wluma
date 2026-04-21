@@ -62,6 +62,7 @@ pub struct BacklightOutput {
 #[derive(Debug, Clone)]
 pub struct DdcUtilOutput {
     pub name: String,
+    pub identifier: String,
     pub capturer: Capturer,
     pub min_brightness: u64,
     pub predictor: Predictor,

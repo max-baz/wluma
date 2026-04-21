@@ -57,7 +57,7 @@ async fn main() {
                             .map(brightness::Brightness::Backlight)
                     }
                     config::Output::DdcUtil(cfg) => {
-                        brightness::DdcUtil::new(&cfg.name, cfg.min_brightness)
+                        brightness::DdcUtil::new(&cfg.identifier, cfg.min_brightness)
                             .map(brightness::Brightness::DdcUtil)
                     }
                 };

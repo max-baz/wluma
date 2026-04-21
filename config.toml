@@ -17,7 +17,8 @@ path = "/sys/class/backlight/intel_backlight"
 capturer = "wayland"
 
 # [[output.ddcutil]]
-# name = "Dell Inc. DELL P2415Q"
+# name = "HDMI-A-3"
+# identifier = "Dell Inc. DELL P2415Q"
 # capturer = "none"
 
 [[keyboard]]

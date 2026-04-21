@@ -108,6 +108,13 @@ impl Capturer {
             .roundtrip(self)
             .expect("Unable to perform 2nd initial roundtrip");
 
+        if self.output.is_none() {
+            log::warn!(
+                "Unable to match any Wayland output for config '{}'. Adjust the output name to a substring of the compositor output description. For DDC outputs, keep name for capture matching and use identifier for brightness control if needed.",
+                output_name,
+            );
+        }
+
         let protocol_to_use = match self.protocol {
             WaylandProtocol::ExtImageCopyCaptureV1 => {
                 if self.img_copy_capture_manager.is_none() {
