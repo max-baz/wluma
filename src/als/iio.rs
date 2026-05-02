@@ -37,7 +37,7 @@ impl Als {
                 smol::fs::read_to_string(entry.path().join("name")).map(|name| (name, entry))
             })
             .filter_map(|(name, entry)| async {
-                ["als", "acpi-als", "apds9960", "cros-ec-light"]
+                ["als", "acpi-als", "apds9960", "cros-ec-light", "aop-sensors-als"]
                     .contains(&name.unwrap_or_default().trim())
                     .then_some(entry)
             })
