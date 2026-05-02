@@ -27,3 +27,7 @@ path = "/sys/bus/platform/devices/dell-laptop/leds/dell::kbd_backlight"
 # [[keyboard]]
 # name = "keyboard-thinkpad"
 # path = "/sys/bus/platform/devices/thinkpad_acpi/leds/tpacpi::kbd_backlight"
+
+# [[keyboard]]
+# name = "keyboard-asus"
+# path = "/sys/class/leds/asus::kbd_backlight"
