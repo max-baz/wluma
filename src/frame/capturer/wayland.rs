@@ -110,7 +110,7 @@ impl Capturer {
 
         if self.output.is_none() {
             log::warn!(
-                "Unable to match any Wayland output for config '{}'. Adjust the output name to a substring of the compositor output description. For DDC outputs, keep name for capture matching and use identifier for brightness control if needed.",
+                "Unable to match config '{}' to any Wayland output.",
                 output_name,
             );
         }
