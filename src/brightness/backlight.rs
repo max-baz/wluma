@@ -136,13 +136,19 @@ impl Backlight {
         if self.has_write_permission {
             write(&mut self.file, value as f64).await?;
         } else if let Some(dbus) = &self.dbus {
+            let mut message = dbus
+                .message
+                .duplicate()
+                .map_err(Error::msg)?
+                .append1(value as u32);
+            // SetBrightness has no meaningful return value. Without this flag the
+            // connection is write-only and never drained, so logind's method-return
+            // replies pile up in the bus daemon's outgoing queue indefinitely,
+            // eventually exhausting the per-user message-memory quota and breaking
+            // D-Bus for every other client of the same user.
+            message.set_no_reply(true);
             dbus.connection
-                .send(
-                    dbus.message
-                        .duplicate()
-                        .map_err(Error::msg)?
-                        .append1(value as u32),
-                )
+                .send(message)
                 .map_err(|_| anyhow!("Unable to send brightness change message via dbus"))?;
             self.pending_dbus_write = true;
         } else {
