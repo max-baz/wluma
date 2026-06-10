@@ -141,11 +141,6 @@ impl Backlight {
                 .duplicate()
                 .map_err(Error::msg)?
                 .append1(value as u32);
-            // SetBrightness has no meaningful return value. Without this flag the
-            // connection is write-only and never drained, so logind's method-return
-            // replies pile up in the bus daemon's outgoing queue indefinitely,
-            // eventually exhausting the per-user message-memory quota and breaking
-            // D-Bus for every other client of the same user.
             message.set_no_reply(true);
             dbus.connection
                 .send(message)
