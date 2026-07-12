@@ -16,6 +16,7 @@ pub enum Brightness {
     Mock {
         get: Vec<u64>,
         set: Vec<u64>,
+        min_step: u64,
     },
 }
 
@@ -40,6 +41,16 @@ impl Brightness {
                 assert_eq!(set.remove(0), value);
                 Ok(value)
             }
+        }
+    }
+
+    pub fn min_step(&self) -> u64 {
+        match self {
+            Brightness::DdcUtil(_) => 1,
+            Brightness::Backlight(b) => b.min_step(),
+
+            #[cfg(test)]
+            Brightness::Mock { min_step, .. } => *min_step,
         }
     }
 

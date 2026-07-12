@@ -90,15 +90,19 @@ impl Controller {
     fn update_target(&mut self, desired: u64) {
         match (&self.target, self.current) {
             (Some(old_target), _) if old_target.desired == desired => (),
-            (_, Some(current)) if desired == current => (),
+            (_, Some(current)) if desired.abs_diff(current) < self.brightness.min_step() => (),
             (_, Some(current)) => {
                 let max_transition_steps = TRANSITION_MAX_MS
                     .div_ceil(self.brightness.transition_step_ms())
                     .max(1);
+                let step_size = desired
+                    .abs_diff(current)
+                    .div_ceil(max_transition_steps)
+                    .max(self.brightness.min_step()) as i64;
                 let step = if desired > current {
-                    (desired - current).div_ceil(max_transition_steps) as i64
+                    step_size
                 } else {
-                    -((current - desired).div_ceil(max_transition_steps) as i64)
+                    -step_size
                 };
                 self.target = Some(Target { desired, step });
             }
@@ -112,7 +116,15 @@ impl Controller {
                 if target.reached(current) {
                     self.target = None;
                 } else {
-                    let new_value = current.saturating_add_signed(target.step);
+                    let new_value = if target.step > 0 {
+                        current
+                            .saturating_add_signed(target.step)
+                            .min(target.desired)
+                    } else {
+                        current
+                            .saturating_add_signed(target.step)
+                            .max(target.desired)
+                    };
                     match self.brightness.set(new_value).await {
                         Ok(set_value) => {
                             if set_value == current {
@@ -148,12 +160,20 @@ mod tests {
     }
 
     fn brightness_mock(get: Vec<u64>, set: Vec<u64>) -> Brightness {
-        Brightness::Mock { get, set }
+        Brightness::Mock {
+            get,
+            set,
+            min_step: 1,
+        }
+    }
+
+    fn brightness_mock_with_min_step(get: Vec<u64>, set: Vec<u64>, min_step: u64) -> Brightness {
+        Brightness::Mock { get, set, min_step }
     }
 
     fn is_brightness_spent(mock: &Brightness) -> bool {
         match mock {
-            Brightness::Mock { get, set } => get.is_empty() && set.is_empty(),
+            Brightness::Mock { get, set, .. } => get.is_empty() && set.is_empty(),
             _ => unreachable!(),
         }
     }
@@ -278,6 +298,40 @@ mod tests {
             controller.update_target(desired);
             assert_eq!(Some(target(desired, expected_step)), controller.target);
         }
+    }
+
+    #[test]
+    fn test_update_target_ignore_when_desired_within_min_step_of_current() {
+        let old_target = Some(target(10000, -20));
+        let (mut controller, _, _) = setup(brightness_mock_with_min_step(vec![], vec![], 100));
+        controller.target = old_target;
+        controller.current = Some(10000);
+
+        controller.update_target(10099);
+
+        assert_eq!(old_target, controller.target);
+    }
+
+    #[test]
+    fn test_update_target_step_is_at_least_min_step() {
+        let (mut controller, _, _) = setup(brightness_mock_with_min_step(vec![], vec![], 100));
+        controller.current = Some(10000);
+
+        controller.update_target(10150);
+
+        assert_eq!(Some(target(10150, 100)), controller.target);
+    }
+
+    #[apply(test!)]
+    async fn test_transition_does_not_overshoot_desired() {
+        let (mut controller, _, _) = setup(brightness_mock_with_min_step(vec![], vec![10150], 100));
+        controller.current = Some(10100);
+        controller.target = Some(target(10150, 100));
+
+        controller.transition().await;
+
+        assert_eq!(Some(10150), controller.current);
+        assert!(is_brightness_spent(&controller.brightness));
     }
 
     #[apply(test!)]

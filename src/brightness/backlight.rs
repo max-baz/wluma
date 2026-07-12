@@ -130,6 +130,10 @@ impl Backlight {
         }
     }
 
+    pub fn min_step(&self) -> u64 {
+        (self.max_brightness / 256).max(1)
+    }
+
     pub async fn set(&mut self, value: u64) -> Result<u64> {
         let value = value.clamp(self.min_brightness, self.max_brightness);
 
