@@ -21,6 +21,7 @@ pub struct Controller {
 struct Target {
     desired: u64,
     step: i64,
+    sleep_ms: u64,
 }
 
 impl Target {
@@ -95,16 +96,32 @@ impl Controller {
                 let max_transition_steps = TRANSITION_MAX_MS
                     .div_ceil(self.brightness.transition_step_ms())
                     .max(1);
-                let step_size = desired
-                    .abs_diff(current)
-                    .div_ceil(max_transition_steps)
-                    .max(self.brightness.min_step()) as i64;
-                let step = if desired > current {
-                    step_size
+                let delta = desired.abs_diff(current);
+                let min_step = self.brightness.min_step();
+                // When min_step binds, keep the transition duration by
+                // stretching the interval instead of shortening the ramp.
+                let (step_size, sleep_ms) = if delta.div_ceil(max_transition_steps) >= min_step {
+                    (
+                        delta.div_ceil(max_transition_steps),
+                        self.brightness.transition_step_ms(),
+                    )
                 } else {
-                    -step_size
+                    let steps = delta.div_ceil(min_step).max(1);
+                    (
+                        min_step,
+                        (TRANSITION_MAX_MS / steps).max(self.brightness.transition_step_ms()),
+                    )
                 };
-                self.target = Some(Target { desired, step });
+                let step = if desired > current {
+                    step_size as i64
+                } else {
+                    -(step_size as i64)
+                };
+                self.target = Some(Target {
+                    desired,
+                    step,
+                    sleep_ms,
+                });
             }
             _ => unreachable!("Current value cannot be None at this point"),
         };
@@ -138,7 +155,7 @@ impl Controller {
                             err
                         ),
                     };
-                    thread::sleep(Duration::from_millis(self.brightness.transition_step_ms()));
+                    thread::sleep(Duration::from_millis(target.sleep_ms));
                 }
             }
             _ => unreachable!("Current and target values cannot be None at this point"),
@@ -156,7 +173,19 @@ mod tests {
 
     // Intentionally not in main code to prevent confusing fields by accident
     fn target(desired: u64, step: i64) -> Target {
-        Target { desired, step }
+        Target {
+            desired,
+            step,
+            sleep_ms: 1,
+        }
+    }
+
+    fn target_with_sleep(desired: u64, step: i64, sleep_ms: u64) -> Target {
+        Target {
+            desired,
+            step,
+            sleep_ms,
+        }
     }
 
     fn brightness_mock(get: Vec<u64>, set: Vec<u64>) -> Brightness {
@@ -313,13 +342,17 @@ mod tests {
     }
 
     #[test]
-    fn test_update_target_step_is_at_least_min_step() {
+    fn test_update_target_step_is_at_least_min_step_with_stretched_interval() {
         let (mut controller, _, _) = setup(brightness_mock_with_min_step(vec![], vec![], 100));
         controller.current = Some(10000);
 
+        // min_step binds: 2 steps of 100, spread over the transition duration
         controller.update_target(10150);
+        assert_eq!(Some(target_with_sleep(10150, 100, 100)), controller.target);
 
-        assert_eq!(Some(target(10150, 100)), controller.target);
+        // min_step does not bind: step and interval as without min_step
+        controller.update_target(40000);
+        assert_eq!(Some(target_with_sleep(40000, 150, 1)), controller.target);
     }
 
     #[apply(test!)]
