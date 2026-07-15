@@ -109,7 +109,9 @@ impl Controller {
                     let steps = delta.div_ceil(min_step).max(1);
                     (
                         min_step,
-                        (TRANSITION_MAX_MS / steps).max(self.brightness.transition_step_ms()),
+                        TRANSITION_MAX_MS
+                            .div_ceil(steps)
+                            .max(self.brightness.transition_step_ms()),
                     )
                 };
                 let step = if desired > current {
