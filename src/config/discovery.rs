@@ -189,7 +189,7 @@ fn display_identifier(display: &Display) -> Option<String> {
         .serial_number
         .clone()
         .filter(|value| !value.is_empty())
-        .or_else(|| display.info.serial.map(|value| value.to_string()))
+        .or_else(|| display.info.serial.map(|value| format!("{:#010x}", value)))
         .or_else(|| {
             display
                 .info
