@@ -40,18 +40,19 @@ pub fn topology() -> Vec<String> {
 pub fn outputs() -> Vec<app::Output> {
     let connectors = connectors();
     let mut backlights = backlights(&connectors);
+    let fallback_backlight = fallback_backlight(&connectors, &backlights);
     let mut used_backlights = HashSet::new();
     let mut displays = None;
     let mut outputs = Vec::new();
 
-    for connector in connectors {
+    for (connector_index, connector) in connectors.into_iter().enumerate() {
         let backlight = backlights
             .iter_mut()
             .enumerate()
             .filter(|(index, backlight)| {
                 !used_backlights.contains(index)
-                    && (backlight.connector.as_deref() == Some(&connector.name)
-                        || same_edid(&backlight.edid, &connector.edid))
+                    && (matches_connector(backlight, &connector)
+                        || fallback_backlight == Some((connector_index, *index)))
             })
             .max_by_key(|(_, backlight)| backlight.rank);
 
@@ -199,6 +200,45 @@ fn backlights(connectors: &[Connector]) -> Vec<Backlight> {
             }
         })
         .collect()
+}
+
+fn matches_connector(backlight: &Backlight, connector: &Connector) -> bool {
+    backlight.connector.as_deref() == Some(&connector.name)
+        || same_edid(&backlight.edid, &connector.edid)
+}
+
+fn fallback_backlight(
+    connectors: &[Connector],
+    backlights: &[Backlight],
+) -> Option<(usize, usize)> {
+    let mut unmatched_internal = connectors.iter().enumerate().filter(|(_, connector)| {
+        is_internal(&connector.name)
+            && !backlights
+                .iter()
+                .any(|backlight| matches_connector(backlight, connector))
+    });
+    let (connector_index, _) = unmatched_internal.next()?;
+    if unmatched_internal.next().is_some() {
+        return None;
+    }
+
+    let mut orphaned = backlights.iter().enumerate().filter(|(_, backlight)| {
+        !connectors
+            .iter()
+            .any(|connector| matches_connector(backlight, connector))
+    });
+    let (index, _) = orphaned.next()?;
+    if orphaned.next().is_some() {
+        return None;
+    }
+
+    Some((connector_index, index))
+}
+
+fn is_internal(name: &str) -> bool {
+    ["eDP-", "LVDS-", "DSI-"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn same_edid(left: &[u8], right: &[u8]) -> bool {
@@ -368,6 +408,57 @@ mod tests {
         };
         backlight.kind = app::BacklightKind::Keyboard;
         output
+    }
+
+    fn connector(name: &str) -> Connector {
+        Connector {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/sys/class/drm/card0-{name}")),
+            edid: Vec::new(),
+        }
+    }
+
+    fn discovered_backlight(name: &str) -> Backlight {
+        Backlight {
+            path: PathBuf::from(format!("/sys/class/backlight/{name}")),
+            connector: None,
+            edid: Vec::new(),
+            rank: 0,
+        }
+    }
+
+    #[test]
+    fn associates_single_orphaned_backlight_with_single_internal_connector() {
+        let connectors = vec![connector("eDP-1"), connector("HDMI-A-1")];
+        let backlights = vec![discovered_backlight("apple-panel-bl")];
+
+        assert_eq!(fallback_backlight(&connectors, &backlights), Some((0, 0)));
+    }
+
+    #[test]
+    fn ignores_existing_associations_when_selecting_a_fallback() {
+        let connectors = vec![connector("eDP-1"), connector("DSI-1")];
+        let mut associated = discovered_backlight("known-panel");
+        associated.connector = Some("eDP-1".to_string());
+        let backlights = vec![associated, discovered_backlight("apple-panel-bl")];
+
+        assert_eq!(fallback_backlight(&connectors, &backlights), Some((1, 1)));
+    }
+
+    #[test]
+    fn does_not_guess_an_ambiguous_backlight_association() {
+        let connectors = vec![connector("eDP-1"), connector("DSI-1")];
+        let backlights = vec![
+            discovered_backlight("panel-1"),
+            discovered_backlight("panel-2"),
+        ];
+
+        assert_eq!(fallback_backlight(&connectors, &backlights), None);
+        assert_eq!(fallback_backlight(&connectors[..1], &backlights), None);
+        assert_eq!(
+            fallback_backlight(&[connector("HDMI-A-1")], &backlights[..1]),
+            None
+        );
     }
 
     #[test]
