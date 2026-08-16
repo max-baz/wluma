@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
+use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::ZxdgOutputV1;
 use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::ZkdeScreencastStreamUnstableV1;
 use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_unstable_v1::{
     Pointer, ZkdeScreencastUnstableV1,
@@ -15,9 +17,17 @@ struct OutputContext {
     name: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
+struct XdgOutputContext {
+    output: WlOutput,
+    output_context: OutputContext,
+}
+
 #[derive(Default)]
 struct State {
     manager: Option<ZkdeScreencastUnstableV1>,
+    xdg_output_manager: Option<ZxdgOutputManagerV1>,
+    outputs: Vec<(WlOutput, OutputContext, bool)>,
     output: Option<WlOutput>,
     output_name: Option<String>,
     output_match: Option<OutputMatch>,
@@ -50,6 +60,20 @@ fn find(output_name: &str, create_stream: bool) -> Result<(Option<u32>, Option<S
 
     let mut state = State::default();
     queue.roundtrip(&mut state)?;
+    if let Some(manager) = state.xdg_output_manager.as_ref() {
+        for (output, output_context, needs_xdg_output) in &state.outputs {
+            if *needs_xdg_output {
+                manager.get_xdg_output(
+                    output,
+                    &qh,
+                    XdgOutputContext {
+                        output: output.clone(),
+                        output_context: output_context.clone(),
+                    },
+                );
+            }
+        }
+    }
     queue.roundtrip(&mut state)?;
 
     let output = state
@@ -98,15 +122,17 @@ impl Dispatch<WlRegistry, OutputContext> for State {
         } = event
         {
             if interface == WlOutput::interface().name {
-                registry.bind::<WlOutput, _, _>(
-                    name,
-                    version.min(4),
-                    qh,
-                    OutputContext {
-                        desired_output: context.desired_output.clone(),
-                        name: Arc::new(Mutex::new(None)),
-                    },
-                );
+                let output_context = OutputContext {
+                    desired_output: context.desired_output.clone(),
+                    name: Arc::new(Mutex::new(None)),
+                };
+                let version = version.min(4);
+                let output =
+                    registry.bind::<WlOutput, _, _>(name, version, qh, output_context.clone());
+                state.outputs.push((output, output_context, version < 4));
+            } else if interface == ZxdgOutputManagerV1::interface().name {
+                state.xdg_output_manager =
+                    Some(registry.bind::<ZxdgOutputManagerV1, _, _>(name, version.min(3), qh, ()));
             } else if interface == ZkdeScreencastUnstableV1::interface().name {
                 state.manager = Some(registry.bind::<ZkdeScreencastUnstableV1, _, _>(
                     name,
@@ -130,36 +156,84 @@ impl Dispatch<WlOutput, OutputContext> for State {
     ) {
         use wayland_client::protocol::wl_output::Event;
 
-        let candidate = match event {
-            Event::Name { name } => {
-                *context.name.lock().unwrap() = Some(name.clone());
-                if state.output.as_ref() == Some(output) {
-                    state.output_name = Some(name.clone());
-                }
-                output_match(&name, &context.desired_output, true)
-            }
+        match event {
+            Event::Name { name } => match_output(state, output, context, name, true),
             Event::Description { description } => {
-                output_match(&description, &context.desired_output, false)
+                match_output(state, output, context, description, false)
             }
-            _ => None,
-        };
-        if let Some(candidate) = candidate {
-            let same_output = state.output.as_ref() == Some(output);
-            match match_action(state.output_match, candidate, same_output) {
-                MatchAction::Select => {
-                    state.output = Some(output.clone());
-                    state.output_name = context.name.lock().unwrap().clone();
-                    state.output_match = Some(candidate);
-                }
-                MatchAction::Replace => {
-                    state.output = Some(output.clone());
-                    state.output_name = context.name.lock().unwrap().clone();
-                    state.output_match = Some(candidate);
-                    state.output_match_ambiguous = false;
-                }
-                MatchAction::Ambiguous => state.output_match_ambiguous = true,
-                MatchAction::Ignore => {}
+            _ => {}
+        }
+    }
+}
+
+fn match_output(
+    state: &mut State,
+    output: &WlOutput,
+    context: &OutputContext,
+    value: String,
+    exact: bool,
+) {
+    if exact {
+        *context.name.lock().unwrap() = Some(value.clone());
+        if state.output.as_ref() == Some(output) {
+            state.output_name = Some(value.clone());
+        }
+    }
+    if let Some(candidate) = output_match(&value, &context.desired_output, exact) {
+        let same_output = state.output.as_ref() == Some(output);
+        match match_action(state.output_match, candidate, same_output) {
+            MatchAction::Select => {
+                state.output = Some(output.clone());
+                state.output_name = context.name.lock().unwrap().clone();
+                state.output_match = Some(candidate);
             }
+            MatchAction::Replace => {
+                state.output = Some(output.clone());
+                state.output_name = context.name.lock().unwrap().clone();
+                state.output_match = Some(candidate);
+                state.output_match_ambiguous = false;
+            }
+            MatchAction::Ambiguous => state.output_match_ambiguous = true,
+            MatchAction::Ignore => {}
+        }
+    }
+}
+
+impl Dispatch<ZxdgOutputManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZxdgOutputManagerV1,
+        _: <ZxdgOutputManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, XdgOutputContext> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgOutputV1,
+        event: <ZxdgOutputV1 as Proxy>::Event,
+        context: &XdgOutputContext,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::Event;
+
+        match event {
+            Event::Name { name } => {
+                match_output(state, &context.output, &context.output_context, name, true)
+            }
+            Event::Description { description } => match_output(
+                state,
+                &context.output,
+                &context.output_context,
+                description,
+                false,
+            ),
+            _ => {}
         }
     }
 }
