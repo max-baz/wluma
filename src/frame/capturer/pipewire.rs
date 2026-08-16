@@ -7,7 +7,9 @@ use drm_fourcc::DrmFourcc;
 use pipewire as pw;
 use pw::spa;
 use pw::spa::pod::Pod;
+use std::cell::RefCell;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,7 +32,12 @@ pub fn run(
     active: Arc<AtomicBool>,
 ) {
     match prepare(output_name, protocol) {
-        Ok(source) => run_prepared(source, controller, vulkan_device, active),
+        Ok(source) => {
+            let (_, result) = run_prepared(source, controller, vulkan_device, active);
+            if let Err(error) = result {
+                log::error!("Unable to capture PipeWire screen stream: {error:#}");
+            }
+        }
         Err(error) => log::error!("Unable to create PipeWire screen stream: {error:#}"),
     }
 }
@@ -54,10 +61,19 @@ pub(super) fn run_prepared(
     controller: Controller,
     vulkan_device: Option<&str>,
     active: Arc<AtomicBool>,
-) {
-    if let Err(error) = capture(source.0, source.1, controller, vulkan_device, active) {
-        log::error!("Unable to capture PipeWire screen stream: {error:#}");
-    }
+) -> (Controller, Result<()>) {
+    let controller = Rc::new(RefCell::new(controller));
+    let result = capture(
+        source.0,
+        source.1,
+        Rc::clone(&controller),
+        vulkan_device,
+        active,
+    );
+    let controller = Rc::into_inner(controller)
+        .expect("PipeWire capture retained the predictor controller")
+        .into_inner();
+    (controller, result)
 }
 
 fn automatic_source(output_name: &str) -> Result<Source> {
@@ -84,7 +100,7 @@ fn portal_source(output_name: &str) -> Result<(u32, Option<Portal>)> {
 }
 
 struct Data {
-    controller: Controller,
+    controller: Rc<RefCell<Controller>>,
     format: spa::param::video::VideoInfoRaw,
     vulkan: Vulkan,
     last_frame_at: Option<Instant>,
@@ -93,15 +109,16 @@ struct Data {
 fn capture(
     node: u32,
     portal: Option<Portal>,
-    controller: Controller,
+    controller: Rc<RefCell<Controller>>,
     vulkan_device: Option<&str>,
     active: Arc<AtomicBool>,
 ) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let timer_loop = mainloop.clone();
+    let shutdown_active = active.clone();
     let shutdown_timer = mainloop.loop_().add_timer(move |_| {
-        if !active.load(Ordering::Relaxed) {
+        if !shutdown_active.load(Ordering::Relaxed) {
             timer_loop.quit();
         }
     });
@@ -229,7 +246,7 @@ fn capture(
                 .vulkan
                 .luma_percent_from_external_fd(&object)
                 .expect("Unable to process PipeWire DMA-BUF with Vulkan");
-            smol::block_on(state.controller.adjust(luma));
+            smol::block_on(state.controller.borrow_mut().adjust(luma));
         })
         .register()?;
 
@@ -312,7 +329,11 @@ fn capture(
         &mut params,
     )?;
     mainloop.run();
-    Ok(())
+    if active.load(Ordering::Relaxed) {
+        Err(anyhow!("PipeWire screen stream stopped unexpectedly"))
+    } else {
+        Ok(())
+    }
 }
 
 fn modifier_property(modifiers: &[u64]) -> spa::pod::Property {

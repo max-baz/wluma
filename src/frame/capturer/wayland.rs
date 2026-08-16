@@ -2,7 +2,7 @@ use crate::config::WaylandProtocol;
 use crate::frame::object::Object;
 use crate::frame::vulkan::Vulkan;
 use crate::predictor::Controller;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -45,6 +45,7 @@ pub struct Capturer {
     output_match_ambiguous: bool,
     pending_frame: Option<Object>,
     dmabuf_formats: Vec<(u32, Vec<u64>)>,
+    failure: Option<anyhow::Error>,
     controller: Option<Controller>,
     // linux-dmabuf-v1
     dmabuf: Option<ZwpLinuxDmabufV1>,
@@ -95,6 +96,7 @@ impl Capturer {
             output_match_ambiguous: false,
             pending_frame: None,
             dmabuf_formats: Vec::new(),
+            failure: None,
             controller: None,
             // linux-dmabuf-v1
             dmabuf: None,
@@ -114,7 +116,7 @@ impl Capturer {
 }
 
 impl Capturer {
-    pub fn is_supported() -> Result<bool> {
+    pub fn supported_protocols() -> Result<Vec<WaylandProtocol>> {
         let mut capturer = Self::new(WaylandProtocol::Any);
         let connection = Connection::connect_to_env().context("Unable to connect to Wayland")?;
         let display = connection.display();
@@ -130,11 +132,20 @@ impl Capturer {
         event_queue
             .roundtrip(&mut capturer)
             .context("Unable to query Wayland protocols")?;
-        Ok(capturer.img_copy_capture_manager.is_some()
+        let mut protocols = Vec::new();
+        if capturer.img_copy_capture_manager.is_some()
             && capturer.img_capture_source_manager.is_some()
             && capturer.dmabuf.is_some()
-            || capturer.screencopy_manager.is_some() && capturer.dmabuf.is_some()
-            || capturer.dmabuf_manager.is_some())
+        {
+            protocols.push(WaylandProtocol::ExtImageCopyCaptureV1);
+        }
+        if capturer.screencopy_manager.is_some() && capturer.dmabuf.is_some() {
+            protocols.push(WaylandProtocol::WlrScreencopyUnstableV1);
+        }
+        if capturer.dmabuf_manager.is_some() {
+            protocols.push(WaylandProtocol::WlrExportDmabufUnstableV1);
+        }
+        Ok(protocols)
     }
 
     pub fn run(
@@ -143,10 +154,21 @@ impl Capturer {
         controller: Controller,
         vulkan_device: Option<&str>,
         active: Arc<AtomicBool>,
-    ) {
+    ) -> (Controller, Result<()>) {
+        self.controller = Some(controller);
+        let result = self.run_inner(output_name, vulkan_device, active);
+        (self.controller.take().unwrap(), result)
+    }
+
+    fn run_inner(
+        &mut self,
+        output_name: &str,
+        vulkan_device: Option<&str>,
+        active: Arc<AtomicBool>,
+    ) -> Result<()> {
         self.vulkan_device = vulkan_device.map(str::to_string);
         let connection =
-            Connection::connect_to_env().expect("Unable to connect to Wayland display");
+            Connection::connect_to_env().context("Unable to connect to Wayland display")?;
         let display = connection.display();
         let mut event_queue = connection.new_event_queue();
         let qh = event_queue.handle();
@@ -161,47 +183,59 @@ impl Capturer {
         // 1. process registry events
         event_queue
             .roundtrip(self)
-            .expect("Unable to perform initial roundtrip");
+            .context("Unable to perform initial Wayland roundtrip")?;
 
         // 2. registry requested wl_output events, process those
         event_queue
             .roundtrip(self)
-            .expect("Unable to perform 2nd initial roundtrip");
+            .context("Unable to perform second initial Wayland roundtrip")?;
 
         if self.output.is_none() {
-            log::warn!(
-                "Unable to match config '{}' to any Wayland output.",
-                output_name,
-            );
-        } else if self.output_match_ambiguous {
-            log::error!("Multiple Wayland outputs match config '{}'.", output_name);
+            return Err(anyhow!(
+                "Unable to match config '{output_name}' to any Wayland output"
+            ));
+        }
+        if self.output_match_ambiguous {
+            return Err(anyhow!(
+                "Multiple Wayland outputs match config '{output_name}'"
+            ));
         }
 
         let protocol_to_use = match self.protocol {
             WaylandProtocol::ExtImageCopyCaptureV1 => {
                 if self.img_copy_capture_manager.is_none() {
-                    panic!("Requested to use ext-image-copy-capture-v1 protocol, but it's not available");
+                    return Err(anyhow!(
+                        "Requested ext-image-copy-capture-v1 protocol is not available"
+                    ));
                 }
                 if self.img_capture_source_manager.is_none() {
-                    panic!("Requested to use ext-image-copy-capture-v1 protocol, but a required ext-image-capture-source-v1 protocol it's not available");
+                    return Err(anyhow!("ext-image-copy-capture-v1 requires unavailable ext-image-capture-source-v1"));
                 }
                 if self.dmabuf.is_none() {
-                    panic!("Requested to use ext-image-copy-capture-v1 protocol, but a required linux-dmabuf-v1 protocol it's not available");
+                    return Err(anyhow!(
+                        "ext-image-copy-capture-v1 requires unavailable linux-dmabuf-v1"
+                    ));
                 }
                 WaylandProtocol::ExtImageCopyCaptureV1
             }
             WaylandProtocol::WlrScreencopyUnstableV1 => {
                 if self.screencopy_manager.is_none() {
-                    panic!("Requested to use wlr-screencopy-unstable-v1 protocol, but it's not available");
+                    return Err(anyhow!(
+                        "Requested wlr-screencopy-unstable-v1 protocol is not available"
+                    ));
                 }
                 if self.dmabuf.is_none() {
-                    panic!("Requested to use wlr-screencopy-unstable-v1 protocol, but a required linux-dmabuf-v1 protocol it's not available");
+                    return Err(anyhow!(
+                        "wlr-screencopy-unstable-v1 requires unavailable linux-dmabuf-v1"
+                    ));
                 }
                 WaylandProtocol::WlrScreencopyUnstableV1
             }
             WaylandProtocol::WlrExportDmabufUnstableV1 => {
                 if self.dmabuf_manager.is_none() {
-                    panic!("Requested to use wlr-export-dmabuf-unstable-v1 protocol, but it's not available");
+                    return Err(anyhow!(
+                        "Requested wlr-export-dmabuf-unstable-v1 protocol is not available"
+                    ));
                 }
                 WaylandProtocol::WlrExportDmabufUnstableV1
             }
@@ -216,7 +250,9 @@ impl Capturer {
                 } else if self.dmabuf_manager.is_some() {
                     WaylandProtocol::WlrExportDmabufUnstableV1
                 } else {
-                    panic!("No supported Wayland protocols found to capture screen contents, set capturer=\"none\" in the config, or report an issue if you believe it's a mistake");
+                    return Err(anyhow!(
+                        "No supported Wayland screen capture protocol is available"
+                    ));
                 }
             }
         };
@@ -230,9 +266,8 @@ impl Capturer {
             } else {
                 Vulkan::new(None)
             }
-            .expect("Unable to initialize Vulkan"),
+            .context("Unable to initialize Vulkan for Wayland capture")?,
         );
-        self.controller = Some(controller);
 
         while active.load(Ordering::Relaxed) {
             if !self.is_processing_frame {
@@ -303,8 +338,13 @@ impl Capturer {
 
             event_queue
                 .dispatch_pending(self)
-                .expect("Error dispatching Wayland events");
-            connection.flush().expect("Error flushing Wayland requests");
+                .context("Error dispatching Wayland events")?;
+            if let Some(error) = self.failure.take() {
+                return Err(error);
+            }
+            connection
+                .flush()
+                .context("Error flushing Wayland requests")?;
             if let Some(guard) = event_queue.prepare_read() {
                 let mut fd = libc::pollfd {
                     fd: connection.as_fd().as_raw_fd(),
@@ -312,11 +352,17 @@ impl Capturer {
                     revents: 0,
                 };
                 let ready = unsafe { libc::poll(&mut fd, 1, 200) };
+                if ready < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("Error polling Wayland display");
+                }
                 if ready > 0 {
-                    guard.read().expect("Error reading Wayland events");
+                    guard.read().context("Error reading Wayland events")?;
                 }
             }
         }
+
+        Ok(())
     }
 }
 
@@ -549,12 +595,19 @@ impl Dispatch<ZwlrExportDmabufFrameV1, ()> for Capturer {
             }
 
             Event::Ready { .. } => {
-                let luma = state
+                let result = state
                     .vulkan
                     .as_mut()
                     .unwrap()
-                    .luma_percent_from_external_fd(&state.pending_frame.take().unwrap())
-                    .expect("Unable to compute luma percent");
+                    .luma_percent_from_external_fd(&state.pending_frame.take().unwrap());
+                let luma = match result {
+                    Ok(luma) => luma,
+                    Err(error) => {
+                        state.failure = Some(error.context("Unable to process Wayland DMA-BUF"));
+                        frame.destroy();
+                        return;
+                    }
+                };
 
                 // TODO: replace with await
                 smol::block_on(state.controller.as_mut().unwrap().adjust(luma));
@@ -629,8 +682,10 @@ impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for Capturer {
         use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::Event;
 
         if let Event::MainDevice { device } = event {
-            let (major, minor) =
-                parse_drm_device(&device).expect("Compositor sent an invalid DMA-BUF main device");
+            let Some((major, minor)) = parse_drm_device(&device) else {
+                state.failure = Some(anyhow!("Compositor sent an invalid DMA-BUF main device"));
+                return;
+            };
             log::debug!("linux-dmabuf-v1 main device={major}:{minor}");
             state.drm_device = Some((major, minor));
         }
@@ -710,12 +765,22 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for Capturer {
                     let pending_frame = Object::new(width, height, 1, format);
                     let dmabuf_params = state.dmabuf.as_ref().unwrap().create_params(qh, ());
                     let allowed_modifiers = [0];
-                    let (fd, offset, stride, modifier) = state
+                    let result = state
                         .vulkan
                         .as_mut()
                         .unwrap()
-                        .init_exportable_frame_image(&pending_frame, &allowed_modifiers)
-                        .expect("Unable to init exportable frame image");
+                        .init_exportable_frame_image(&pending_frame, &allowed_modifiers);
+                    let (fd, offset, stride, modifier) = match result {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            state.failure =
+                                Some(error.context(
+                                    "Vulkan cannot export the compositor-requested DMA-BUF",
+                                ));
+                            frame.destroy();
+                            return;
+                        }
+                    };
 
                     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
 
@@ -751,12 +816,19 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for Capturer {
             }
 
             Event::Ready { .. } => {
-                let luma = state
+                let result = state
                     .vulkan
                     .as_mut()
                     .unwrap()
-                    .luma_percent_from_internal_fd()
-                    .expect("Unable to compute luma percent");
+                    .luma_percent_from_internal_fd();
+                let luma = match result {
+                    Ok(luma) => luma,
+                    Err(error) => {
+                        state.failure = Some(error.context("Unable to process Wayland DMA-BUF"));
+                        frame.destroy();
+                        return;
+                    }
+                };
 
                 // TODO: replace with await
                 smol::block_on(state.controller.as_mut().unwrap().adjust(luma));
@@ -842,16 +914,24 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
             }
 
             Event::DmabufDevice { device } => {
-                let (major, minor) = parse_drm_device(&device)
-                    .expect("Compositor sent an invalid DMA-BUF allocation device");
+                let Some((major, minor)) = parse_drm_device(&device) else {
+                    state.failure = Some(anyhow!(
+                        "Compositor sent an invalid DMA-BUF allocation device"
+                    ));
+                    return;
+                };
                 log::debug!("ext-image-copy-capture DMA-BUF allocation device={major}:{minor}");
                 let device_changed = state.drm_device != Some((major, minor));
                 state.drm_device = Some((major, minor));
                 if state.vulkan_device.is_none() && device_changed {
-                    state.vulkan =
-                        Some(Vulkan::new_for_drm_device(major, minor).expect(
-                            "Unable to initialize Vulkan on the compositor's DMA-BUF device",
-                        ));
+                    match Vulkan::new_for_drm_device(major, minor) {
+                        Ok(vulkan) => state.vulkan = Some(vulkan),
+                        Err(error) => {
+                            state.failure = Some(error.context(
+                                "Unable to initialize Vulkan on the compositor's DMA-BUF device",
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -867,6 +947,9 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
             }
 
             Event::Done => {
+                if state.failure.is_some() {
+                    return;
+                }
                 if let Some(buffer) = state.wl_buffer.take() {
                     buffer.destroy()
                 }
@@ -890,9 +973,12 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
                     (!modifiers.is_empty()).then_some((*format, modifiers))
                 });
                 state.dmabuf_formats.clear();
-                let (format, modifiers) = selection.expect(
-                    "No compositor-provided DMA-BUF format and modifier can be exported by Vulkan",
-                );
+                let Some((format, modifiers)) = selection else {
+                    state.failure = Some(anyhow::anyhow!(
+                        "No compositor-provided DMA-BUF format and modifier can be exported by Vulkan"
+                    ));
+                    return;
+                };
                 log::debug!(
                     "ext-image-copy-capture selected DMA-BUF constraints: DRM format={format}, size={}x{}, modifiers={modifiers:x?}",
                     dimensions.0,
@@ -902,12 +988,20 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
                 let pending_frame = state.pending_frame.as_ref().unwrap();
 
                 let dmabuf_params = state.dmabuf.as_ref().unwrap().create_params(qh, ());
-                let (fd, offset, stride, modifier) = state
+                let result = state
                     .vulkan
                     .as_mut()
                     .unwrap()
-                    .init_exportable_frame_image(pending_frame, &modifiers)
-                    .expect("Unable to init exportable frame image");
+                    .init_exportable_frame_image(pending_frame, &modifiers);
+                let (fd, offset, stride, modifier) = match result {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        state.failure = Some(
+                            error.context("Vulkan cannot export the compositor-requested DMA-BUF"),
+                        );
+                        return;
+                    }
+                };
 
                 let fd = unsafe { BorrowedFd::borrow_raw(fd) };
 
@@ -963,12 +1057,19 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for Capturer {
 
         match event {
             Event::Ready => {
-                let luma = state
+                let result = state
                     .vulkan
                     .as_mut()
                     .unwrap()
-                    .luma_percent_from_internal_fd()
-                    .expect("Unable to compute luma percent");
+                    .luma_percent_from_internal_fd();
+                let luma = match result {
+                    Ok(luma) => luma,
+                    Err(error) => {
+                        state.failure = Some(error.context("Unable to process Wayland DMA-BUF"));
+                        frame.destroy();
+                        return;
+                    }
+                };
 
                 // TODO: replace with await
                 smol::block_on(state.controller.as_mut().unwrap().adjust(luma));
