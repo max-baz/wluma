@@ -177,15 +177,23 @@ fn time_level_at(levels: &HashMap<u64, u64>, hour: u64) -> u64 {
 }
 
 fn parse() -> Result<app::Config> {
-    let file_config = xdg::BaseDirectories::with_prefix("wluma")
-        .find_config_file("config.toml")
-        .and_then(|cfg_path| fs::read_to_string(cfg_path).ok())
-        .unwrap_or_else(|| include_str!("../../config.toml").to_string());
+    let config_path = xdg::BaseDirectories::with_prefix("wluma").find_config_file("config.toml");
+    let file_config = config_path
+        .map(fs::read_to_string)
+        .transpose()?
+        .map(|config| toml::from_str(&config))
+        .transpose()?
+        .unwrap_or_default();
 
-    parse_config_str(&file_config)
+    parse_file_config(file_config)
 }
 
+#[cfg(test)]
 fn parse_config_str(file_config: &str) -> Result<app::Config> {
+    parse_file_config(toml::from_str(file_config)?)
+}
+
+fn parse_file_config(file_config: file::Config) -> Result<app::Config> {
     let parse_map = |values: HashMap<String, String>| -> Result<HashMap<u64, String>> {
         values
             .into_iter()
@@ -199,7 +207,6 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
             .collect()
     };
 
-    let file_config: file::Config = toml::from_str(file_config)?;
     let mut output = file_config
         .output
         .backlight

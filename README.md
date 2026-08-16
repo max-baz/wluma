@@ -72,7 +72,7 @@ In order to access backlight devices, `wluma` must either:
 
 ## Configuration
 
-The `config.toml` in repository represents default config values. To change them, copy the file into `$XDG_CONFIG_HOME/wluma/config.toml` and adjust as desired.
+The configuration is entirely optional, as everything is auto-detected to the best extent possible. To make any changes described below, create `$XDG_CONFIG_HOME/wluma/config.toml` and set the relevant overrides.
 
 ### ALS
 
@@ -95,11 +95,24 @@ scale = "linear"
 
 The `lux` scale accepts illuminance values without an upper bound. The `linear` scale accepts normalized values from 0 to 100. The socket is detected whether it exists before wluma starts or appears later.
 
-Webcam ALS reports perceived camera-frame lightness from 0 to 100. Time ALS uses a circular, linearly interpolated schedule of synthetic light levels:
+Webcam ALS reports perceived camera-frame lightness from 0 to 100. Set `video` to the zero-based V4L2 device number, such as `0` for `/dev/video0`:
+
+```toml
+[als.webcam]
+video = 0
+```
+
+Time ALS uses a circular, linearly interpolated schedule of synthetic light levels. Hours must be from 0 to 23 and levels from 0 to 100:
 
 ```toml
 [als.time]
 levels = { 0 = 0, 7 = 10, 9 = 40, 12 = 70, 16 = 50, 19 = 10, 21 = 0 }
+```
+
+To explicitly disable ambient-light input, use:
+
+```toml
+[als.none]
 ```
 
 The adaptive predictor stores numeric ALS readings and continuously interpolates between nearby learned conditions. IIO lux is mapped to a logarithmic coordinate, while webcam and synthetic time values are linear.
@@ -141,7 +154,7 @@ name = "HDMI-A-3"
 capturer = "none"
 ```
 
-Explicit `output.backlight` and `output.ddcutil` entries remain supported. The `path` of a backlight entry is optional when its `name` matches a discovered connector. Supplying a path or DDC identifier overrides the discovered value. To exclude a discovered output, set `enabled = false`:
+Explicit `output.backlight` and `output.ddcutil` entries remain supported. The `path` of a backlight entry is optional when its `name` matches a discovered connector. When set, it must point to a sysfs backlight device directory such as `/sys/class/backlight/intel_backlight`. Supplying a path or DDC identifier overrides the discovered value. `enabled`, `capturer`, `vulkan_device`, `predictor` and `gamma` are available for both output types. To exclude a discovered output, set `enabled = false`:
 
 ```toml
 [[output.ddcutil]]
@@ -193,7 +206,13 @@ gamma = false
 
 ### Keyboards
 
-Keyboard backlights are automatically discovered under `/sys/class/leds` when their LED device name contains `kbd_backlight`, which covers common Dell, ThinkPad and ASUS devices. They are logged with `RUST_LOG=debug`. Explicit `[[keyboard]]` entries remain available for devices that do not follow this naming convention, and an entry pointing to an automatically discovered path replaces rather than duplicates it.
+Keyboard backlights are automatically discovered under `/sys/class/leds` when their LED device name contains `kbd_backlight`, which covers common Dell, ThinkPad and ASUS devices. They are logged with `RUST_LOG=debug`. Explicit `[[keyboard]]` entries remain available for devices that do not follow this naming convention, and an entry pointing to an automatically discovered path replaces rather than duplicates it. `name` must be unique across all displays and keyboards, while `path` must point to the keyboard LED's sysfs directory:
+
+```toml
+[[keyboard]]
+name = "keyboard"
+path = "/sys/class/leds/asus::kbd_backlight"
+```
 
 ### Algorithm
 
