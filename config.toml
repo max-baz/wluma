@@ -24,6 +24,7 @@
 # name = "HDMI-A-3"
 # identifier = "Dell Inc. DELL P2415Q"
 # capturer = "none"
+# enabled = false
 
 # [[keyboard]]
 # name = "keyboard-dell"

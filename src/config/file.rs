@@ -93,6 +93,7 @@ pub struct BacklightOutput {
     pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
     pub gamma: Option<bool>,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -103,6 +104,7 @@ pub struct DdcUtilOutput {
     pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
     pub gamma: Option<bool>,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]

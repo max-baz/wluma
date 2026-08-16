@@ -141,7 +141,13 @@ name = "HDMI-A-3"
 capturer = "none"
 ```
 
-Explicit `output.backlight` and `output.ddcutil` entries remain supported. The `path` of a backlight entry is optional when its `name` matches a discovered connector. Supplying a path or DDC identifier overrides the discovered value.
+Explicit `output.backlight` and `output.ddcutil` entries remain supported. The `path` of a backlight entry is optional when its `name` matches a discovered connector. Supplying a path or DDC identifier overrides the discovered value. To exclude a discovered output, set `enabled = false`:
+
+```toml
+[[output.ddcutil]]
+name = "DP-1"
+enabled = false
+```
 
 The `name` field identifies the Wayland output and is matched as a substring against descriptions containing model, manufacturer and serial number (like `eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`). Automatically discovered output names use the unambiguous DRM connector name.
 

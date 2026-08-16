@@ -215,6 +215,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
                 predictor: match_predictor(o.predictor.unwrap_or_default())?,
                 als_direction: crate::predictor::AlsDirection::Increasing,
                 gamma: o.gamma.unwrap_or(true),
+                enabled: o.enabled.unwrap_or(true),
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -235,6 +236,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
                     vulkan_device: o.vulkan_device.into(),
                     predictor: match_predictor(o.predictor.unwrap_or_default())?,
                     gamma: o.gamma.unwrap_or(true),
+                    enabled: o.enabled.unwrap_or(true),
                 }))
             })
             .collect::<Result<Vec<_>>>()?,
@@ -250,6 +252,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
             predictor: app::Predictor::Adaptive,
             als_direction: crate::predictor::AlsDirection::Decreasing,
             gamma: false,
+            enabled: true,
         })
     }));
 
@@ -796,6 +799,23 @@ vulkan_device = "/dev/dri/renderD128"
                 assert!(matches!(output.capturer, app::Capturer::None));
                 assert_eq!(output.vulkan_device.as_deref(), Some("/dev/dri/renderD128"));
             }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_output_can_be_disabled() {
+        let config = parse_config_str(
+            r#"
+[[output.ddcutil]]
+name = "DP-1"
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::DdcUtil(output) => assert!(!output.enabled),
             _ => unreachable!(),
         }
     }

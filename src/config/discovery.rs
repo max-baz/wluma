@@ -67,6 +67,7 @@ pub fn outputs() -> Vec<app::Output> {
                 predictor: app::Predictor::Adaptive,
                 als_direction: crate::predictor::AlsDirection::Increasing,
                 gamma: true,
+                enabled: true,
             }));
             continue;
         }
@@ -102,6 +103,7 @@ pub fn outputs() -> Vec<app::Output> {
                         min_brightness: 1,
                         predictor: app::Predictor::Adaptive,
                         gamma: true,
+                        enabled: true,
                     }));
                     continue;
                 }
@@ -144,6 +146,7 @@ fn keyboards() -> Vec<app::Output> {
                 predictor: app::Predictor::Adaptive,
                 als_direction: crate::predictor::AlsDirection::Decreasing,
                 gamma: false,
+                enabled: true,
             }))
         })
         .collect()
@@ -244,7 +247,12 @@ pub fn merge(configured: Vec<app::Output>, mut detected: Vec<app::Output>) -> Ve
             name(detected_output) == output_name
                 || same_backlight_path(detected_output, &configured_output)
         });
-        if let Some(position) = detected_position {
+        if !enabled(&configured_output) {
+            if let Some(position) = detected_position {
+                detected.remove(position);
+            }
+            log::debug!("Ignoring disabled output '{output_name}'");
+        } else if let Some(position) = detected_position {
             let mut detected_output = detected.remove(position);
             apply_overrides(&mut detected_output, configured_output);
             outputs.push(detected_output);
@@ -313,6 +321,13 @@ fn apply_overrides(detected: &mut app::Output, configured: app::Output) {
     }
 }
 
+fn enabled(output: &app::Output) -> bool {
+    match output {
+        app::Output::Backlight(output) => output.enabled,
+        app::Output::DdcUtil(output) => output.enabled,
+    }
+}
+
 fn has_brightness_path(output: &app::Output) -> bool {
     match output {
         app::Output::Backlight(output) => !output.path.is_empty(),
@@ -342,6 +357,7 @@ mod tests {
             predictor: app::Predictor::Adaptive,
             als_direction: crate::predictor::AlsDirection::Increasing,
             gamma: true,
+            enabled: true,
         })
     }
 
@@ -372,6 +388,24 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn disabled_outputs_are_excluded() {
+        let mut configured = backlight("DP-1", "", app::Capturer::Auto);
+        let app::Output::Backlight(output) = &mut configured else {
+            unreachable!()
+        };
+        output.enabled = false;
+        let detected = vec![
+            backlight("eDP-1", "/sys/backlight/panel", app::Capturer::Auto),
+            backlight("DP-1", "/sys/backlight/external", app::Capturer::Auto),
+        ];
+
+        let merged = merge(vec![configured], detected);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(name(&merged[0]), "eDP-1");
     }
 
     #[test]
@@ -407,6 +441,7 @@ mod tests {
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
             gamma: false,
+            enabled: true,
         });
         let detected = app::Output::DdcUtil(app::DdcUtilOutput {
             name: "HDMI-A-1".to_string(),
@@ -417,6 +452,7 @@ mod tests {
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
             gamma: true,
+            enabled: true,
         });
 
         match &merge(vec![configured], vec![detected])[0] {
