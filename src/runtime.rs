@@ -1,4 +1,4 @@
-use crate::{als, brightness, config, frame, idle, predictor};
+use crate::{als, brightness, config, frame, gamma, idle, predictor};
 use anyhow::Result;
 use smol::channel::{self, Receiver, Sender};
 use smol::Task;
@@ -35,7 +35,9 @@ struct Session {
     active: Arc<AtomicBool>,
     brightness: Task<()>,
     capturer: Task<()>,
+    gamma: Option<Task<()>>,
     commands: Sender<brightness::Command>,
+    gamma_commands: Option<Sender<gamma::Command>>,
 }
 
 impl Runtime {
@@ -172,16 +174,53 @@ impl Runtime {
     ) -> std::result::Result<String, String> {
         use crate::control::Action;
         match action {
-            Action::Get(name) => Ok(format!(
-                "{}%",
-                self.output_command(&name, brightness::CommandAction::Get)
+            Action::Get(property, name) => match property {
+                crate::control::Property::Brightness => Ok(format!(
+                    "{}%",
+                    self.output_command(&name, brightness::CommandAction::Get)
+                        .await?
+                )),
+                crate::control::Property::Dim => Ok(format!(
+                    "{}%",
+                    self.gamma_output_command(&name, gamma::CommandAction::Get(property))
+                        .await?
+                )),
+                crate::control::Property::Temperature => Ok(format!(
+                    "{}K",
+                    self.gamma_output_command(&name, gamma::CommandAction::Get(property))
+                        .await?
+                )),
+            },
+            Action::Set(property, name, adjustment) => match property {
+                crate::control::Property::Brightness => Ok(format!(
+                    "{}%",
+                    self.output_command(
+                        &name,
+                        brightness::CommandAction::Set(
+                            adjustment
+                                .try_into()
+                                .map_err(|error: anyhow::Error| error.to_string())?
+                        ),
+                    )
                     .await?
-            )),
-            Action::Set(name, adjustment) => Ok(format!(
-                "{}%",
-                self.output_command(&name, brightness::CommandAction::Set(adjustment))
+                )),
+                crate::control::Property::Dim => Ok(format!(
+                    "{}%",
+                    self.gamma_output_command(
+                        &name,
+                        gamma::CommandAction::Set(property, adjustment),
+                    )
                     .await?
-            )),
+                )),
+                crate::control::Property::Temperature => Ok(format!(
+                    "{}K",
+                    self.gamma_output_command(
+                        &name,
+                        gamma::CommandAction::Set(property, adjustment),
+                    )
+                    .await?
+                )),
+            },
             Action::Pause(name, duration) => {
                 self.output_commands(name.as_deref(), || {
                     brightness::CommandAction::Pause(duration)
@@ -244,6 +283,33 @@ impl Runtime {
         send_command(&session.commands, action).await
     }
 
+    async fn gamma_output_command(
+        &self,
+        name: &str,
+        action: gamma::CommandAction,
+    ) -> std::result::Result<u64, String> {
+        let session = self
+            .sessions
+            .get(name)
+            .ok_or_else(|| format!("unknown or disconnected output '{name}'"))?;
+        let commands = session
+            .gamma_commands
+            .as_ref()
+            .ok_or_else(|| format!("gamma control is unavailable for '{name}'"))?;
+        let (response_tx, response_rx) = channel::bounded(1);
+        commands
+            .send(gamma::Command {
+                action,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| "gamma controller stopped responding".to_string())?;
+        response_rx
+            .recv()
+            .await
+            .map_err(|_| "gamma controller stopped responding".to_string())?
+    }
+
     async fn step(&mut self) {
         let topology = config::topology();
         let topology_changed = topology != self.topology;
@@ -296,7 +362,9 @@ impl Runtime {
             .sessions
             .iter()
             .filter(|(_, session)| {
-                session.brightness.is_finished() || session.capturer.is_finished()
+                session.brightness.is_finished()
+                    || session.capturer.is_finished()
+                    || session.gamma.as_ref().is_some_and(Task::is_finished)
             })
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
@@ -384,22 +452,25 @@ impl Session {
         let (command_tx, command_rx) = channel::bounded(32);
         let paused = Arc::new(AtomicBool::new(false));
 
-        let (name, capturer, vulkan_device, output_predictor, als_direction) = match &output {
-            config::Output::Backlight(output) => (
-                output.name.clone(),
-                output.capturer.clone(),
-                output.vulkan_device.clone(),
-                output.predictor.clone(),
-                output.als_direction,
-            ),
-            config::Output::DdcUtil(output) => (
-                output.name.clone(),
-                output.capturer.clone(),
-                output.vulkan_device.clone(),
-                output.predictor.clone(),
-                predictor::AlsDirection::Increasing,
-            ),
-        };
+        let (name, capturer, vulkan_device, output_predictor, als_direction, gamma_enabled) =
+            match &output {
+                config::Output::Backlight(output) => (
+                    output.name.clone(),
+                    output.capturer.clone(),
+                    output.vulkan_device.clone(),
+                    output.predictor.clone(),
+                    output.als_direction,
+                    output.gamma,
+                ),
+                config::Output::DdcUtil(output) => (
+                    output.name.clone(),
+                    output.capturer.clone(),
+                    output.vulkan_device.clone(),
+                    output.predictor.clone(),
+                    predictor::AlsDirection::Increasing,
+                    output.gamma,
+                ),
+            };
 
         let backend = match &output {
             config::Output::Backlight(output) => {
@@ -446,6 +517,76 @@ impl Session {
                 .await;
         });
 
+        let mut additional = Vec::new();
+        let (gamma, gamma_commands) = if gamma_enabled && !keyboard {
+            let gamma_available = Arc::new(AtomicBool::new(false));
+            let (dim_als_tx, dim_als_rx) = channel::bounded(1);
+            let (temperature_als_tx, temperature_als_rx) = channel::bounded(1);
+            registrations.send(dim_als_tx).await?;
+            registrations.send(temperature_als_tx).await?;
+            let (dim_user_tx, dim_user_rx) = channel::bounded(128);
+            let (temperature_user_tx, temperature_user_rx) = channel::bounded(128);
+            let (dim_prediction_tx, dim_prediction_rx) = channel::bounded(128);
+            let (temperature_prediction_tx, temperature_prediction_rx) = channel::bounded(128);
+            let (gamma_command_tx, gamma_command_rx) = channel::bounded(32);
+            additional.push(
+                predictor::Controller::adaptive(
+                    predictor::controller::adaptive::Controller::new_kind(
+                        (dim_prediction_tx, dim_user_rx, dim_als_rx),
+                        true,
+                        &name,
+                        als_scale,
+                        legacy_thresholds,
+                        predictor::Kind::Dim,
+                    )
+                    .without_initial_value()
+                    .with_als_direction(predictor::AlsDirection::Decreasing)
+                    .with_luma_direction(
+                        predictor::controller::adaptive::LumaDirection::Increasing,
+                    ),
+                )
+                .with_enabled(gamma_available.clone()),
+            );
+            additional.push(
+                predictor::Controller::adaptive(
+                    predictor::controller::adaptive::Controller::new_kind(
+                        (
+                            temperature_prediction_tx,
+                            temperature_user_rx,
+                            temperature_als_rx,
+                        ),
+                        true,
+                        &name,
+                        als_scale,
+                        legacy_thresholds,
+                        predictor::Kind::Temperature,
+                    )
+                    .without_initial_value()
+                    .without_luma(),
+                )
+                .with_enabled(gamma_available.clone()),
+            );
+            let gamma_controller = gamma::Controller::new(
+                gamma::Inputs {
+                    dim_user: dim_user_tx,
+                    temperature_user: temperature_user_tx,
+                    dim_predictions: dim_prediction_rx,
+                    temperature_predictions: temperature_prediction_rx,
+                    commands: gamma_command_rx,
+                },
+                paused.clone(),
+                gamma_available,
+                status.clone(),
+                name.clone(),
+            );
+            (
+                Some(smol::spawn(gamma_controller.run())),
+                Some(gamma_command_tx),
+            )
+        } else {
+            (None, None)
+        };
+
         let controller = match output_predictor {
             config::Predictor::Manual { points } => {
                 predictor::Controller::manual(predictor::controller::manual::Controller::new(
@@ -473,6 +614,7 @@ impl Session {
                 .with_als_direction(als_direction),
             ),
         }
+        .with_additional(additional)
         .with_status(status.clone(), name.clone(), paused);
         let frame_capturer = match capturer {
             config::Capturer::Auto => frame::capturer::Capturer::Auto,
@@ -502,13 +644,18 @@ impl Session {
             active,
             brightness,
             capturer,
+            gamma,
             commands: command_tx,
+            gamma_commands,
         })
     }
 
     async fn stop(self) {
         self.active.store(false, Ordering::Relaxed);
         self.brightness.cancel().await;
+        if let Some(gamma) = self.gamma {
+            gamma.cancel().await;
+        }
         self.capturer.await;
     }
 }

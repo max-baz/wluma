@@ -92,6 +92,7 @@ pub struct BacklightOutput {
     pub capturer: Option<Capturer>,
     pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
+    pub gamma: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -101,6 +102,7 @@ pub struct DdcUtilOutput {
     pub capturer: Option<Capturer>,
     pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
+    pub gamma: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]

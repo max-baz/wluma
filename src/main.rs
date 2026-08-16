@@ -9,6 +9,7 @@ mod config;
 mod control;
 mod device_file;
 mod frame;
+mod gamma;
 mod idle;
 mod predictor;
 mod runtime;

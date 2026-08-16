@@ -214,6 +214,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
                 vulkan_device: o.vulkan_device.into(),
                 predictor: match_predictor(o.predictor.unwrap_or_default())?,
                 als_direction: crate::predictor::AlsDirection::Increasing,
+                gamma: o.gamma.unwrap_or(true),
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -233,6 +234,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
                     capturer: match_capturer(o.capturer.unwrap_or_default()),
                     vulkan_device: o.vulkan_device.into(),
                     predictor: match_predictor(o.predictor.unwrap_or_default())?,
+                    gamma: o.gamma.unwrap_or(true),
                 }))
             })
             .collect::<Result<Vec<_>>>()?,
@@ -247,6 +249,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
             vulkan_device: app::VulkanDevice::Auto,
             predictor: app::Predictor::Adaptive,
             als_direction: crate::predictor::AlsDirection::Decreasing,
+            gamma: false,
         })
     }));
 
@@ -793,6 +796,32 @@ vulkan_device = "/dev/dri/renderD128"
                 assert!(matches!(output.capturer, app::Capturer::None));
                 assert_eq!(output.vulkan_device.as_deref(), Some("/dev/dri/renderD128"));
             }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_gamma_can_be_disabled_per_output() {
+        let config = parse_config_str(
+            r#"
+[als.none]
+
+[[output.backlight]]
+name = "panel"
+gamma = false
+
+[[output.ddcutil]]
+name = "DP-1"
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::Backlight(output) => assert!(!output.gamma),
+            _ => unreachable!(),
+        }
+        match &config.output[1] {
+            app::Output::DdcUtil(output) => assert!(output.gamma),
             _ => unreachable!(),
         }
     }

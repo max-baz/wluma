@@ -14,6 +14,23 @@ use std::time::Duration;
 const SOCKET_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Property {
+    Brightness,
+    Dim,
+    Temperature,
+}
+
+impl Property {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Brightness => "brightness",
+            Self::Dim => "dim",
+            Self::Temperature => "temperature",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Adjustment {
     pub percent: u8,
@@ -21,10 +38,17 @@ pub struct Adjustment {
     pub increase: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct ValueAdjustment {
+    pub value: u64,
+    pub relative: bool,
+    pub increase: bool,
+}
+
 #[derive(Debug)]
 pub enum Action {
-    Get(String),
-    Set(String, Adjustment),
+    Get(Property, String),
+    Set(Property, String, ValueAdjustment),
     Pause(Option<String>, Option<Duration>),
     Resume(Option<String>),
     Toggle(Option<String>),
@@ -76,6 +100,8 @@ struct ScreenStatus {
 struct MonitorStatus {
     kind: String,
     brightness: Option<u8>,
+    dim: Option<u8>,
+    temperature: Option<u32>,
     manual_pause: bool,
     idle_pause: bool,
 }
@@ -122,6 +148,8 @@ impl Hub {
                 MonitorStatus {
                     kind: kind.to_string(),
                     brightness: None,
+                    dim: None,
+                    temperature: None,
                     manual_pause: false,
                     idle_pause: false,
                 },
@@ -165,6 +193,24 @@ impl Hub {
         self.change(|state| {
             if let Some(monitor) = state.monitors.get_mut(name) {
                 monitor.brightness = Some(brightness);
+            }
+        });
+    }
+
+    pub fn set_gamma(&self, name: &str, dim: u8, temperature: u32) {
+        self.change(|state| {
+            if let Some(monitor) = state.monitors.get_mut(name) {
+                monitor.dim = Some(dim);
+                monitor.temperature = Some(temperature);
+            }
+        });
+    }
+
+    pub fn clear_gamma(&self, name: &str) {
+        self.change(|state| {
+            if let Some(monitor) = state.monitors.get_mut(name) {
+                monitor.dim = None;
+                monitor.temperature = None;
             }
         });
     }
@@ -381,8 +427,15 @@ async fn handle(mut stream: UnixStream, hub: Hub, commands: Sender<Command>) -> 
 
 fn parse_action(fields: &[&str]) -> Result<Action> {
     match fields {
-        ["get", name] => Ok(Action::Get((*name).to_string())),
-        ["set", name, value] => Ok(Action::Set((*name).to_string(), parse_adjustment(value)?)),
+        ["get", property, name] => Ok(Action::Get(parse_property(property)?, (*name).to_string())),
+        ["set", property, name, value] => {
+            let property = parse_property(property)?;
+            Ok(Action::Set(
+                property,
+                (*name).to_string(),
+                parse_value_adjustment(property, value)?,
+            ))
+        }
         ["pause", target, duration] => Ok(Action::Pause(
             parse_target(target),
             if *duration == "-" {
@@ -401,30 +454,76 @@ fn parse_target(value: &str) -> Option<String> {
     (value != "*").then(|| value.to_string())
 }
 
-pub fn parse_adjustment(value: &str) -> Result<Adjustment> {
-    let invalid = || anyhow!("brightness must be a percentage from 0% to 100%");
-    let (relative, increase, number) = if let Some(value) = value.strip_prefix('+') {
-        (true, true, value.strip_suffix('%').ok_or_else(invalid)?)
-    } else if let Some(value) = value.strip_prefix('-') {
-        (true, false, value.strip_suffix('%').ok_or_else(invalid)?)
-    } else if let Some(value) = value.strip_suffix("%+") {
+pub fn parse_property(value: &str) -> Result<Property> {
+    match value {
+        "brightness" => Ok(Property::Brightness),
+        "dim" => Ok(Property::Dim),
+        "temperature" => Ok(Property::Temperature),
+        _ => Err(anyhow!("property must be brightness, dim, or temperature")),
+    }
+}
+
+pub fn parse_value_adjustment(property: Property, value: &str) -> Result<ValueAdjustment> {
+    if property == Property::Temperature && value == "neutral" {
+        return Ok(ValueAdjustment {
+            value: crate::gamma::ramp::NEUTRAL_TEMPERATURE,
+            relative: false,
+            increase: true,
+        });
+    }
+    let suffix = match property {
+        Property::Brightness | Property::Dim => '%',
+        Property::Temperature => 'K',
+    };
+    let invalid = || match property {
+        Property::Brightness | Property::Dim => {
+            anyhow!("value must be a percentage from 0% to 100%")
+        }
+        Property::Temperature => {
+            anyhow!("temperature must be neutral or between 1000K and 25000K")
+        }
+    };
+    let (relative, increase, value) = if let Some(value) = value.strip_prefix('+') {
         (true, true, value)
-    } else if let Some(value) = value.strip_suffix("%-") {
+    } else if let Some(value) = value.strip_prefix('-') {
+        (true, false, value)
+    } else if let Some(value) = value.strip_suffix('+') {
+        (true, true, value)
+    } else if let Some(value) = value.strip_suffix('-') {
         (true, false, value)
     } else {
-        (false, true, value.strip_suffix('%').ok_or_else(invalid)?)
+        (false, true, value)
     };
-    let percent = number
-        .parse::<u8>()
-        .context("brightness must be a percentage from 0% to 100%")?;
-    if percent > 100 {
-        return Err(anyhow!("brightness must be a percentage from 0% to 100%"));
+    let number = value.strip_suffix(suffix).ok_or_else(invalid)?;
+    let value = number.parse::<u64>().map_err(|_| invalid())?;
+    let valid = match property {
+        Property::Brightness | Property::Dim => value <= 100,
+        Property::Temperature if relative => true,
+        Property::Temperature => (1000..=25000).contains(&value),
+    };
+    if !valid {
+        return Err(invalid());
     }
-    Ok(Adjustment {
-        percent,
+    Ok(ValueAdjustment {
+        value,
         relative,
         increase,
     })
+}
+
+impl TryFrom<ValueAdjustment> for Adjustment {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ValueAdjustment) -> Result<Self> {
+        Ok(Self {
+            percent: value
+                .value
+                .try_into()
+                .context("brightness adjustment is too large")?,
+            relative: value.relative,
+            increase: value.increase,
+        })
+    }
 }
 
 async fn write_response(stream: &mut UnixStream, value: &str) -> Result<()> {
@@ -552,7 +651,16 @@ impl Snapshot {
         lines.push(format_row(&idle_headers, &idle_widths));
         lines.push(format_row(&idle_row, &idle_widths));
         lines.push(String::new());
-        let headers = ["OUTPUT", "TYPE", "CAPTURER", "LUMA", "BRIGHTNESS", "STATE"];
+        let headers = [
+            "OUTPUT",
+            "TYPE",
+            "CAPTURER",
+            "LUMA",
+            "BRIGHTNESS",
+            "DIM",
+            "TEMPERATURE",
+            "STATE",
+        ];
         let rows = self
             .monitors
             .iter()
@@ -564,11 +672,13 @@ impl Snapshot {
                     screen.map_or_else(|| "-".to_string(), |screen| screen.capturer.clone()),
                     optional(screen.and_then(|screen| screen.luma), "%"),
                     optional(monitor.brightness, "%"),
+                    optional(monitor.dim, "%"),
+                    optional(monitor.temperature, "K"),
                     monitor.state().to_string(),
                 ]
             })
             .collect::<Vec<_>>();
-        let widths = std::array::from_fn::<_, 6, _>(|column| {
+        let widths = std::array::from_fn::<_, 8, _>(|column| {
             rows.iter()
                 .map(|row| row[column].len())
                 .max()
@@ -594,9 +704,11 @@ impl Snapshot {
         for (name, monitor) in &self.monitors {
             let luma = self.screens.get(name).and_then(|screen| screen.luma);
             parts.push(format!(
-                "{name}:luma={},brightness={},{}",
+                "{name}:luma={},brightness={},dim={},temperature={},{}",
                 optional(luma, "%"),
                 optional(monitor.brightness, "%"),
+                optional(monitor.dim, "%"),
+                optional(monitor.temperature, "K"),
                 monitor.state()
             ));
         }
@@ -610,12 +722,14 @@ impl Snapshot {
             .map(|(name, monitor)| {
                 let screen = self.screens.get(name);
                 format!(
-                    "{{\"name\":{},\"type\":{},\"capturer\":{},\"luma\":{},\"brightness\":{},\"state\":{},\"paused\":{},\"idle\":{}}}",
+                    "{{\"name\":{},\"type\":{},\"capturer\":{},\"luma\":{},\"brightness\":{},\"dim\":{},\"temperature\":{},\"state\":{},\"paused\":{},\"idle\":{}}}",
                     json_string(name),
                     json_string(&monitor.kind),
                     screen.map_or_else(|| "null".to_string(), |screen| json_string(&screen.capturer)),
                     json_option(screen.and_then(|screen| screen.luma)),
                     json_option(monitor.brightness),
+                    json_option(monitor.dim),
+                    json_option(monitor.temperature),
                     json_string(monitor.state()),
                     monitor.paused(),
                     monitor.idle_pause
@@ -677,31 +791,52 @@ fn json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_adjustment, Hub};
+    use super::{parse_value_adjustment, Hub, Property};
 
     #[test]
     fn parses_brightness_adjustments() {
-        let absolute = parse_adjustment("60%").unwrap();
-        assert_eq!(absolute.percent, 60);
+        let absolute = parse_value_adjustment(Property::Brightness, "60%").unwrap();
+        assert_eq!(absolute.value, 60);
         assert!(!absolute.relative);
 
         for value in ["+5%", "5%+"] {
-            let adjustment = parse_adjustment(value).unwrap();
-            assert_eq!(adjustment.percent, 5);
+            let adjustment = parse_value_adjustment(Property::Brightness, value).unwrap();
+            assert_eq!(adjustment.value, 5);
             assert!(adjustment.relative);
             assert!(adjustment.increase);
         }
 
         for value in ["-5%", "5%-"] {
-            let adjustment = parse_adjustment(value).unwrap();
-            assert_eq!(adjustment.percent, 5);
+            let adjustment = parse_value_adjustment(Property::Brightness, value).unwrap();
+            assert_eq!(adjustment.value, 5);
             assert!(adjustment.relative);
             assert!(!adjustment.increase);
         }
 
-        assert!(parse_adjustment("60").is_err());
-        assert!(parse_adjustment("+5").is_err());
-        assert!(parse_adjustment("101%").is_err());
+        assert!(parse_value_adjustment(Property::Brightness, "60").is_err());
+        assert!(parse_value_adjustment(Property::Brightness, "+5").is_err());
+        assert!(parse_value_adjustment(Property::Brightness, "101%").is_err());
+        assert!(parse_value_adjustment(Property::Brightness, "+101%").is_err());
+    }
+
+    #[test]
+    fn parses_gamma_adjustments() {
+        let dim = parse_value_adjustment(Property::Dim, "+5%").unwrap();
+        assert_eq!(dim.value, 5);
+        assert!(dim.relative);
+        assert!(dim.increase);
+
+        let temperature = parse_value_adjustment(Property::Temperature, "4500K").unwrap();
+        assert_eq!(temperature.value, 4500);
+        assert!(!temperature.relative);
+
+        let neutral = parse_value_adjustment(Property::Temperature, "neutral").unwrap();
+        assert_eq!(neutral.value, crate::gamma::ramp::NEUTRAL_TEMPERATURE);
+        assert!(!neutral.relative);
+
+        assert!(parse_value_adjustment(Property::Dim, "101%").is_err());
+        assert!(parse_value_adjustment(Property::Temperature, "999K").is_err());
+        assert!(parse_value_adjustment(Property::Temperature, "25001K").is_err());
     }
 
     #[test]
@@ -740,9 +875,9 @@ mod tests {
              POWER SOURCE  IDLE STATE  ENABLED  TIMEOUT  BRIGHTNESS\n\
              battery       idle        yes      120s     30%\n\
              \n\
-             OUTPUT               TYPE       CAPTURER  LUMA  BRIGHTNESS  STATE\n\
-             DP-1                 ddc        wayland   16%   99%         idle\n\
-             dell::kbd_backlight  backlight  -         -     0%          active"
+             OUTPUT               TYPE       CAPTURER  LUMA  BRIGHTNESS  DIM  TEMPERATURE  STATE\n\
+             DP-1                 ddc        wayland   16%   99%         -    -            idle\n\
+             dell::kbd_backlight  backlight  -         -     0%          -    -            active"
         );
     }
 }

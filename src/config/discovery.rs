@@ -66,6 +66,7 @@ pub fn outputs() -> Vec<app::Output> {
                 kind: app::BacklightKind::Display,
                 predictor: app::Predictor::Adaptive,
                 als_direction: crate::predictor::AlsDirection::Increasing,
+                gamma: true,
             }));
             continue;
         }
@@ -100,6 +101,7 @@ pub fn outputs() -> Vec<app::Output> {
                         vulkan_device: app::VulkanDevice::Auto,
                         min_brightness: 1,
                         predictor: app::Predictor::Adaptive,
+                        gamma: true,
                     }));
                     continue;
                 }
@@ -141,6 +143,7 @@ fn keyboards() -> Vec<app::Output> {
                 kind: app::BacklightKind::Keyboard,
                 predictor: app::Predictor::Adaptive,
                 als_direction: crate::predictor::AlsDirection::Decreasing,
+                gamma: false,
             }))
         })
         .collect()
@@ -282,6 +285,7 @@ fn apply_overrides(detected: &mut app::Output, configured: app::Output) {
             detected.capturer = configured.capturer;
             detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
+            detected.gamma = configured.gamma;
         }
         (app::Output::DdcUtil(detected), app::Output::DdcUtil(configured)) => {
             detected.name = configured.name;
@@ -292,16 +296,19 @@ fn apply_overrides(detected: &mut app::Output, configured: app::Output) {
             detected.capturer = configured.capturer;
             detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
+            detected.gamma = configured.gamma;
         }
         (app::Output::Backlight(detected), app::Output::DdcUtil(configured)) => {
             detected.capturer = configured.capturer;
             detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
+            detected.gamma = configured.gamma;
         }
         (app::Output::DdcUtil(detected), app::Output::Backlight(configured)) => {
             detected.capturer = configured.capturer;
             detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
+            detected.gamma = configured.gamma;
         }
     }
 }
@@ -334,6 +341,7 @@ mod tests {
             kind: app::BacklightKind::Display,
             predictor: app::Predictor::Adaptive,
             als_direction: crate::predictor::AlsDirection::Increasing,
+            gamma: true,
         })
     }
 
@@ -398,6 +406,7 @@ mod tests {
             vulkan_device: app::VulkanDevice::Auto,
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
+            gamma: false,
         });
         let detected = app::Output::DdcUtil(app::DdcUtilOutput {
             name: "HDMI-A-1".to_string(),
@@ -407,12 +416,14 @@ mod tests {
             vulkan_device: app::VulkanDevice::Auto,
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
+            gamma: true,
         });
 
         match &merge(vec![configured], vec![detected])[0] {
             app::Output::DdcUtil(output) => {
                 assert_eq!(output.identifier, "serial-123");
                 assert!(matches!(output.capturer, app::Capturer::None));
+                assert!(!output.gamma);
             }
             _ => unreachable!(),
         }

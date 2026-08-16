@@ -5,12 +5,39 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, PartialEq, Eq, Serialize, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Kind {
+    Brightness,
+    Dim,
+    Temperature,
+}
+
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Brightness => "brightness",
+            Self::Dim => "dim",
+            Self::Temperature => "temperature",
+        }
+    }
+
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::Brightness => "",
+            Self::Dim => "%",
+            Self::Temperature => "K",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Data {
     pub output_name: String,
     pub entries: Vec<Entry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     legacy_entries_v1: Option<Vec<LegacyEntryV1>>,
+    kind: Kind,
+    thresholds: HashMap<u64, String>,
+    scale: Scale,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
@@ -24,15 +51,58 @@ struct LegacyEntryV1 {
 pub struct Entry {
     pub als: u64,
     pub luma: u8,
+    #[serde(rename = "value")]
     pub brightness: u64,
 }
 
 #[derive(Deserialize)]
 struct StoredData {
     output_name: String,
-    entries: Vec<StoredEntry>,
+    entries: StoredEntries,
     #[serde(default)]
     legacy_entries_v1: Option<Vec<LegacyEntryV1>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredEntries {
+    Legacy(Vec<StoredEntry>),
+    Grouped(StoredEntryGroups),
+}
+
+impl IntoIterator for StoredEntries {
+    type Item = StoredEntry;
+    type IntoIter = std::vec::IntoIter<StoredEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Legacy(entries) => entries.into_iter(),
+            Self::Grouped(groups) => groups.brightness.into_iter(),
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct StoredEntryGroups {
+    brightness: Vec<StoredEntry>,
+    dim: Vec<StoredEntry>,
+    temperature: Vec<StoredEntry>,
+}
+
+#[derive(Serialize)]
+struct SavedData<'a> {
+    output_name: &'a str,
+    entries: SavedEntryGroups<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_entries_v1: &'a Option<Vec<LegacyEntryV1>>,
+}
+
+#[derive(Serialize)]
+struct SavedEntryGroups<'a> {
+    brightness: &'a [Entry],
+    dim: &'a [Entry],
+    temperature: &'a [Entry],
 }
 
 #[derive(Deserialize)]
@@ -40,6 +110,7 @@ struct StoredEntry {
     #[serde(alias = "lux")]
     als: StoredAls,
     luma: u8,
+    #[serde(alias = "value")]
     brightness: u64,
 }
 
@@ -97,21 +168,48 @@ enum StoredAls {
 }
 
 impl Data {
-    pub fn new(output_name: &str) -> Self {
+    pub fn new_kind(
+        output_name: &str,
+        kind: Kind,
+        scale: Scale,
+        thresholds: &HashMap<u64, String>,
+    ) -> Self {
         Self {
             output_name: output_name.to_string(),
             entries: Vec::new(),
             legacy_entries_v1: None,
+            kind,
+            thresholds: thresholds.clone(),
+            scale,
         }
     }
 
-    pub fn load(output_name: &str, thresholds: &HashMap<u64, String>, scale: Scale) -> Self {
+    pub fn load_kind(
+        output_name: &str,
+        kind: Kind,
+        thresholds: &HashMap<u64, String>,
+        scale: Scale,
+    ) -> Self {
+        let (data, migrated) = Self::load_inner(output_name, kind, thresholds, scale);
+        if migrated {
+            data.save().expect("Unable to save migrated learned data");
+        }
+        data
+    }
+
+    fn load_inner(
+        output_name: &str,
+        kind: Kind,
+        thresholds: &HashMap<u64, String>,
+        scale: Scale,
+    ) -> (Self, bool) {
+        let empty = || Self::new_kind(output_name, kind, scale, thresholds);
         let path = match Self::path(output_name) {
             Ok(path) if path.exists() => path,
-            Ok(_) => return Self::new(output_name),
+            Ok(_) => return (empty(), false),
             Err(error) => {
                 log::warn!("Unable to locate learned data for '{output_name}': {error}");
-                return Self::new(output_name);
+                return (empty(), false);
             }
         };
         let stored = match Self::read_file(path)
@@ -120,7 +218,7 @@ impl Data {
             Ok(stored) => stored,
             Err(error) => {
                 log::warn!("Unable to load learned data for '{output_name}': {error}");
-                return Self::new(output_name);
+                return (empty(), false);
             }
         };
         if stored.output_name != output_name {
@@ -129,24 +227,34 @@ impl Data {
                 stored.output_name
             );
         }
-
-        let (data, migrated) = Self::from_stored(output_name, stored, thresholds, scale);
-        if migrated {
-            data.save().expect("Unable to save migrated learned data");
-        }
-        data
+        Self::from_stored(output_name, kind, stored, thresholds, scale)
     }
 
     fn from_stored(
         output_name: &str,
+        kind: Kind,
         stored: StoredData,
         thresholds: &HashMap<u64, String>,
         scale: Scale,
     ) -> (Self, bool) {
         let mut migrated = false;
         let mut legacy_entries_v1 = stored.legacy_entries_v1;
-        let entries = stored
-            .entries
+        let stored_entries = match stored.entries {
+            StoredEntries::Legacy(entries) => {
+                migrated = true;
+                if kind == Kind::Brightness {
+                    entries
+                } else {
+                    Vec::new()
+                }
+            }
+            StoredEntries::Grouped(groups) => match kind {
+                Kind::Brightness => groups.brightness,
+                Kind::Dim => groups.dim,
+                Kind::Temperature => groups.temperature,
+            },
+        };
+        let entries = stored_entries
             .into_iter()
             .filter_map(|entry| {
                 let (entry, legacy) = entry.migrate(thresholds, scale);
@@ -162,16 +270,45 @@ impl Data {
                 output_name: output_name.to_string(),
                 entries,
                 legacy_entries_v1,
+                kind,
+                thresholds: thresholds.clone(),
+                scale,
             },
             migrated,
         )
     }
 
     pub fn save(&self) -> Result<()> {
-        Self::save_to_path(self, &Self::path(&self.output_name)?)
+        lazy_static::lazy_static! {
+            static ref SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        }
+        let _lock = SAVE_LOCK.lock().unwrap();
+        let path = Self::path(&self.output_name)?;
+        let mut groups = [Kind::Brightness, Kind::Dim, Kind::Temperature]
+            .map(|kind| Self::load_inner(&self.output_name, kind, &self.thresholds, self.scale).0);
+        let saved = self.merge(&mut groups);
+        Self::save_to_path(&saved, &path)
     }
 
-    fn save_to_path(&self, path: &Path) -> Result<()> {
+    fn merge<'a>(&'a self, groups: &'a mut [Self; 3]) -> SavedData<'a> {
+        groups[self.kind as usize].entries.clone_from(&self.entries);
+        let legacy_entries_v1 = if self.kind == Kind::Brightness {
+            &self.legacy_entries_v1
+        } else {
+            &groups[Kind::Brightness as usize].legacy_entries_v1
+        };
+        SavedData {
+            output_name: &self.output_name,
+            entries: SavedEntryGroups {
+                brightness: &groups[Kind::Brightness as usize].entries,
+                dim: &groups[Kind::Dim as usize].entries,
+                temperature: &groups[Kind::Temperature as usize].entries,
+            },
+            legacy_entries_v1,
+        }
+    }
+
+    fn save_to_path(saved: &SavedData<'_>, path: &Path) -> Result<()> {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -183,7 +320,7 @@ impl Data {
                 .write(true)
                 .truncate(true)
                 .open(&temporary)?;
-            serde_yaml::to_writer(&mut file, self)?;
+            serde_yaml::to_writer(&mut file, saved)?;
             file.sync_all()?;
             fs::rename(&temporary, path)?;
             if let Some(parent) = path.parent() {
@@ -205,6 +342,37 @@ impl Data {
         Ok(xdg::BaseDirectories::with_prefix("wluma")
             .create_state_directory("")?
             .join(format!("{output_name}.yaml")))
+    }
+}
+
+impl Serialize for Data {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let empty = Vec::new();
+        SavedData {
+            output_name: &self.output_name,
+            entries: SavedEntryGroups {
+                brightness: if self.kind == Kind::Brightness {
+                    &self.entries
+                } else {
+                    &empty
+                },
+                dim: if self.kind == Kind::Dim {
+                    &self.entries
+                } else {
+                    &empty
+                },
+                temperature: if self.kind == Kind::Temperature {
+                    &self.entries
+                } else {
+                    &empty
+                },
+            },
+            legacy_entries_v1: &self.legacy_entries_v1,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -315,21 +483,73 @@ mod tests {
             .into_iter()
             .collect();
 
-        let (migrated, was_migrated) =
-            Data::from_stored("panel", stored, &thresholds, Scale::Linear);
+        let (migrated, was_migrated) = Data::from_stored(
+            "panel",
+            Kind::Brightness,
+            stored,
+            &thresholds,
+            Scale::Linear,
+        );
         assert!(was_migrated);
         assert_eq!(vec![Entry::new(15, 20, 30)], migrated.entries);
 
         let stored = serde_yaml::from_str(&serde_yaml::to_string(&migrated).unwrap()).unwrap();
-        let (reloaded, was_migrated) =
-            Data::from_stored("panel", stored, &thresholds, Scale::Linear);
+        let (reloaded, was_migrated) = Data::from_stored(
+            "panel",
+            Kind::Brightness,
+            stored,
+            &thresholds,
+            Scale::Linear,
+        );
         assert!(!was_migrated);
         assert_eq!(migrated, reloaded);
     }
 
     #[test]
+    fn groups_values_by_kind() {
+        let mut data = Data::new_kind("panel", Kind::Temperature, Scale::Linear, &HashMap::new());
+        data.entries.push(Entry::new(10, 20, 4500));
+        let yaml = serde_yaml::to_string(&data).unwrap();
+        assert!(yaml.contains("brightness: []"));
+        assert!(yaml.contains("dim: []"));
+        assert!(yaml.contains("temperature:"));
+        assert!(yaml.contains("value: 4500"));
+    }
+
+    #[test]
+    fn updating_one_kind_preserves_the_other_kinds() {
+        let thresholds = HashMap::new();
+        let mut groups = [Kind::Brightness, Kind::Dim, Kind::Temperature]
+            .map(|kind| Data::new_kind("panel", kind, Scale::Linear, &thresholds));
+        groups[Kind::Brightness as usize].entries = vec![Entry::new(10, 20, 30)];
+        groups[Kind::Dim as usize].entries = vec![Entry::new(10, 20, 40)];
+        groups[Kind::Temperature as usize].entries = vec![Entry::new(10, 0, 4500)];
+        let mut update = Data::new_kind("panel", Kind::Dim, Scale::Linear, &thresholds);
+        update.entries = vec![Entry::new(20, 30, 50)];
+
+        let yaml = serde_yaml::to_string(&update.merge(&mut groups)).unwrap();
+        let stored: StoredData = serde_yaml::from_str(&yaml).unwrap();
+        let StoredEntries::Grouped(groups) = stored.entries else {
+            unreachable!()
+        };
+
+        assert_eq!(groups.brightness.len(), 1);
+        assert_eq!(groups.brightness[0].brightness, 30);
+        assert_eq!(groups.dim.len(), 1);
+        assert_eq!(groups.dim[0].brightness, 50);
+        assert_eq!(groups.temperature.len(), 1);
+        assert_eq!(groups.temperature[0].brightness, 4500);
+    }
+
+    #[test]
     fn omits_legacy_field_for_new_data() {
-        let yaml = serde_yaml::to_string(&Data::new("panel")).unwrap();
+        let yaml = serde_yaml::to_string(&Data::new_kind(
+            "panel",
+            Kind::Brightness,
+            Scale::Linear,
+            &HashMap::new(),
+        ))
+        .unwrap();
         assert!(!yaml.contains("legacy_entries_v1"));
     }
 }

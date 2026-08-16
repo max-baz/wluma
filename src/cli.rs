@@ -8,8 +8,8 @@ Usage:
 Commands:
   daemon
   status [--json]
-  get OUTPUT
-  set OUTPUT VALUE
+  get [brightness|dim|temperature] OUTPUT
+  set [brightness|dim|temperature] OUTPUT VALUE
   pause [OUTPUT | --all] [--for DURATION]
   resume [OUTPUT | --all]
   toggle [OUTPUT | --all]
@@ -18,8 +18,10 @@ Commands:
   help
 
 Examples:
-  wluma set eDP-1 +5%
-  wluma set DP-1 90%
+  wluma set brightness eDP-1 +5%
+  wluma set dim DP-1 20%
+  wluma set temperature DP-1 4500K
+  wluma set temperature DP-1 neutral
   wluma pause --all --for 3h";
 
 pub enum Mode {
@@ -43,10 +45,24 @@ pub fn parse() -> Result<Mode> {
         [command, flag] if command == "status" && flag == "--json" => {
             command_mode("status-json", false)
         }
-        [command, output] if command == "get" => command_mode(&format!("get\t{output}"), false),
+        [command, output] if command == "get" => {
+            command_mode(&format!("get\tbrightness\t{output}"), false)
+        }
+        [command, property, output] if command == "get" => {
+            crate::control::parse_property(property)?;
+            command_mode(&format!("get\t{property}\t{output}"), false)
+        }
         [command, output, value] if command == "set" => {
-            crate::control::parse_adjustment(value)?;
-            command_mode(&format!("set\t{output}\t{value}"), false)
+            crate::control::parse_value_adjustment(crate::control::Property::Brightness, value)?;
+            command_mode(&format!("set\tbrightness\t{output}\t{value}"), false)
+        }
+        [command, property, output, value] if command == "set" => {
+            let property = crate::control::parse_property(property)?;
+            crate::control::parse_value_adjustment(property, value)?;
+            command_mode(
+                &format!("set\t{}\t{output}\t{value}", property.as_str()),
+                false,
+            )
         }
         [command] if command == "pause" => command_mode("pause\t*\t-", false),
         [command, target] if command == "pause" && target == "--all" => {

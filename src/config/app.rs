@@ -138,6 +138,7 @@ pub struct BacklightOutput {
     pub kind: BacklightKind,
     pub predictor: Predictor,
     pub als_direction: crate::predictor::AlsDirection,
+    pub gamma: bool,
 }
 
 impl fmt::Debug for BacklightOutput {
@@ -150,6 +151,7 @@ impl fmt::Debug for BacklightOutput {
             .field("min_brightness", &self.min_brightness)
             .field("kind", &self.kind)
             .field("predictor", &self.predictor)
+            .field("gamma", &self.gamma)
             .finish()
     }
 }
@@ -163,6 +165,7 @@ pub struct DdcUtilOutput {
     pub vulkan_device: VulkanDevice,
     pub min_brightness: u64,
     pub predictor: Predictor,
+    pub gamma: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

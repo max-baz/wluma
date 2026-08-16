@@ -5,13 +5,34 @@ use crate::{
     als::{Reading, Scale},
     channel_ext::ReceiverExt,
     predictor::{
-        data::{Data, Entry},
+        data::{Data, Entry, Kind},
         AlsDirection,
     },
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 const REPLACEMENT_DISTANCE: f64 = 0.25;
+
+fn collapse_luma(entries: &[Entry]) -> Vec<Entry> {
+    let mut grouped = BTreeMap::<u64, (u128, u64)>::new();
+    for entry in entries {
+        let values = grouped.entry(entry.als).or_default();
+        values.0 += entry.brightness as u128;
+        values.1 += 1;
+    }
+    grouped
+        .into_iter()
+        .map(|(als, (total, count))| {
+            Entry::new(als, 0, ((total + count as u128 / 2) / count as u128) as u64)
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+pub enum LumaDirection {
+    Increasing,
+    Decreasing,
+}
 
 pub struct Controller {
     prediction_tx: Sender<u64>,
@@ -22,10 +43,14 @@ pub struct Controller {
     data: Data,
     stateful: bool,
     initial_brightness: Option<u64>,
+    learn_initial: bool,
+    luma_aware: bool,
     last_als: Option<Reading>,
     output_name: String,
     scale: Scale,
     als_direction: AlsDirection,
+    luma_direction: LumaDirection,
+    kind: Kind,
 }
 
 impl Controller {
@@ -38,10 +63,29 @@ impl Controller {
         scale: Scale,
         legacy_thresholds: &HashMap<u64, String>,
     ) -> Self {
+        Self::new_kind(
+            (prediction_tx, user_rx, als_rx),
+            stateful,
+            output_name,
+            scale,
+            legacy_thresholds,
+            Kind::Brightness,
+        )
+    }
+
+    pub fn new_kind(
+        channels: (Sender<u64>, Receiver<u64>, Receiver<Reading>),
+        stateful: bool,
+        output_name: &str,
+        scale: Scale,
+        legacy_thresholds: &HashMap<u64, String>,
+        kind: Kind,
+    ) -> Self {
+        let (prediction_tx, user_rx, als_rx) = channels;
         let data = if stateful {
-            Data::load(output_name, legacy_thresholds, scale)
+            Data::load_kind(output_name, kind, legacy_thresholds, scale)
         } else {
-            Data::new(output_name)
+            Data::new_kind(output_name, kind, scale, legacy_thresholds)
         };
 
         Self {
@@ -53,16 +97,62 @@ impl Controller {
             data,
             stateful,
             initial_brightness: None,
+            learn_initial: true,
+            luma_aware: true,
             last_als: None,
             output_name: output_name.to_string(),
             scale,
             als_direction: AlsDirection::Increasing,
+            luma_direction: LumaDirection::Decreasing,
+            kind,
         }
+    }
+
+    pub fn without_initial_value(mut self) -> Self {
+        self.learn_initial = false;
+        self
+    }
+
+    pub fn without_luma(mut self) -> Self {
+        self.luma_aware = false;
+        self
     }
 
     pub fn with_als_direction(mut self, als_direction: AlsDirection) -> Self {
         self.als_direction = als_direction;
         self
+    }
+
+    pub fn with_luma_direction(mut self, luma_direction: LumaDirection) -> Self {
+        self.luma_direction = luma_direction;
+        self
+    }
+
+    pub async fn discard_inputs(&mut self) {
+        if self.last_als.is_none() {
+            self.last_als = Some(
+                self.als_rx
+                    .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
+                    .await
+                    .expect("als_rx closed unexpectedly"),
+            );
+            self.user_rx
+                .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
+                .await
+                .expect("user_rx closed unexpectedly");
+        }
+        if let Some(als) = self
+            .als_rx
+            .recv_maybe_last()
+            .await
+            .expect("als_rx closed unexpectedly")
+        {
+            self.last_als = Some(als);
+        }
+        while self.user_rx.try_recv().is_ok() {}
+        self.initial_brightness = None;
+        self.pending = None;
+        self.pending_cooldown.clear();
     }
 
     pub async fn adjust(&mut self, luma: u8) {
@@ -84,7 +174,7 @@ impl Controller {
 
             // If there are no learned entries yet, we will use this as the first data point,
             // assuming that user is happy with the current brightness settings
-            if self.data.entries.is_empty() {
+            if self.learn_initial && self.data.entries.is_empty() {
                 self.initial_brightness = Some(initial_brightness);
             };
         }
@@ -154,21 +244,42 @@ impl Controller {
 
     fn learn(&mut self) {
         let pending = self.pending.take().expect("No pending entry to learn");
-        log::debug!("[{}] Learning {pending:?}", self.output_name);
+        log::debug!(
+            "[{}] Learning {}={}{} (als: {}, luma: {})",
+            self.output_name,
+            self.kind.name(),
+            pending.brightness,
+            self.kind.unit(),
+            pending.als,
+            pending.luma
+        );
 
+        let luma_aware = self.luma_aware;
+        let pending_luma = self.luma(pending.luma);
+        let scale = self.scale;
         self.data.entries.retain(|entry| {
-            let nearby =
-                distance(self.scale, pending.als, pending.luma, entry) <= REPLACEMENT_DISTANCE;
-            let pending_should_be_brighter = match self.als_direction {
+            let entry_luma = if luma_aware { entry.luma } else { 0 };
+            let nearby = if luma_aware {
+                distance(scale, pending.als, pending_luma, entry)
+            } else {
+                (scale.coordinate(pending.als) - scale.coordinate(entry.als)).abs()
+            } <= REPLACEMENT_DISTANCE;
+            let pending_should_be_higher = match self.als_direction {
                 AlsDirection::Increasing => entry.als <= pending.als,
                 AlsDirection::Decreasing => entry.als >= pending.als,
-            } && entry.luma >= pending.luma;
-            let pending_should_be_dimmer = match self.als_direction {
+            } && match self.luma_direction {
+                LumaDirection::Increasing => entry_luma <= pending_luma,
+                LumaDirection::Decreasing => entry_luma >= pending_luma,
+            };
+            let pending_should_be_lower = match self.als_direction {
                 AlsDirection::Increasing => entry.als >= pending.als,
                 AlsDirection::Decreasing => entry.als <= pending.als,
-            } && entry.luma <= pending.luma;
-            let conflict = (pending_should_be_brighter && entry.brightness > pending.brightness)
-                || (pending_should_be_dimmer && entry.brightness < pending.brightness);
+            } && match self.luma_direction {
+                LumaDirection::Increasing => entry_luma >= pending_luma,
+                LumaDirection::Decreasing => entry_luma <= pending_luma,
+            };
+            let conflict = (pending_should_be_higher && entry.brightness > pending.brightness)
+                || (pending_should_be_lower && entry.brightness < pending.brightness);
             !nearby && !conflict
         });
 
@@ -183,11 +294,24 @@ impl Controller {
         }
     }
 
+    fn luma(&self, luma: u8) -> u8 {
+        if self.luma_aware {
+            luma
+        } else {
+            0
+        }
+    }
+
     async fn predict(&mut self, als: u64, luma: u8) {
-        if let Some(prediction) = super::interpolate(&self.data.entries, self.scale, als, luma) {
+        let luma = self.luma(luma);
+        let projected = (!self.luma_aware).then(|| collapse_luma(&self.data.entries));
+        let entries = projected.as_deref().unwrap_or(&self.data.entries);
+        if let Some(prediction) = super::interpolate(entries, self.scale, als, luma) {
             log::trace!(
-                "[{}] Prediction: {prediction} (als: {als}, luma: {luma})",
-                self.output_name
+                "[{}] Prediction: {}={prediction}{} (als: {als}, luma: {luma})",
+                self.output_name,
+                self.kind.name(),
+                self.kind.unit()
             );
             self.prediction_tx
                 .send(prediction)
@@ -230,6 +354,43 @@ mod tests {
             &HashMap::new(),
         );
         Ok((controller, user_tx, prediction_rx))
+    }
+
+    #[apply(test!)]
+    async fn can_ignore_initial_value() -> Result<()> {
+        let (controller, _, prediction_rx) = setup().await?;
+        let mut controller = controller.without_initial_value();
+        controller.adjust(20).await;
+
+        assert!(controller.data.entries.is_empty());
+        assert!(controller.pending.is_none());
+        assert!(prediction_rx.is_empty());
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn can_ignore_luma_without_discarding_it() -> Result<()> {
+        let (mut controller, user_tx, prediction_rx) = setup().await?;
+        controller.data.entries =
+            vec![Entry::new(ALS_DIM, 10, 4000), Entry::new(ALS_DIM, 90, 5000)];
+        controller = controller.without_initial_value().without_luma();
+
+        assert_eq!(
+            vec![Entry::new(ALS_DIM, 10, 4000), Entry::new(ALS_DIM, 90, 5000)],
+            controller.data.entries
+        );
+        controller.adjust(10).await;
+        controller.process(ALS_DIM, 90).await;
+
+        assert_eq!(4500, prediction_rx.recv().await?);
+        assert_eq!(4500, prediction_rx.recv().await?);
+
+        user_tx.send(4600).await?;
+        controller.process(ALS_DIM, 70).await;
+        controller.pending_cooldown.finish();
+        controller.process(ALS_DIM, 20).await;
+        assert_eq!(vec![Entry::new(ALS_DIM, 70, 4600)], controller.data.entries);
+        Ok(())
     }
 
     #[apply(test!)]
@@ -414,6 +575,39 @@ mod tests {
             vec![
                 Entry::new(ALS_DARK, 20, 31),
                 Entry::new(ALS_DIM, 20, 30),
+                Entry::new(ALS_BRIGHT, 20, 29),
+            ],
+            controller.data.entries
+        );
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn dim_cleanup_increases_with_luma_and_decreases_with_als() -> Result<()> {
+        let (controller, _, _) = setup().await?;
+        let mut controller = controller
+            .with_als_direction(AlsDirection::Decreasing)
+            .with_luma_direction(LumaDirection::Increasing);
+        controller.data.entries = vec![
+            Entry::new(ALS_DARK, 20, 31),
+            Entry::new(ALS_DARK, 20, 29),
+            Entry::new(ALS_BRIGHT, 20, 29),
+            Entry::new(ALS_BRIGHT, 20, 31),
+            Entry::new(ALS_DIM, 10, 29),
+            Entry::new(ALS_DIM, 10, 31),
+            Entry::new(ALS_DIM, 30, 31),
+            Entry::new(ALS_DIM, 30, 29),
+        ];
+        controller.pending = Some(Entry::new(ALS_DIM, 20, 30));
+
+        controller.learn();
+
+        assert_eq!(
+            vec![
+                Entry::new(ALS_DARK, 20, 31),
+                Entry::new(ALS_DIM, 10, 29),
+                Entry::new(ALS_DIM, 20, 30),
+                Entry::new(ALS_DIM, 30, 31),
                 Entry::new(ALS_BRIGHT, 20, 29),
             ],
             controller.data.entries

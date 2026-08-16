@@ -46,6 +46,8 @@ pub struct Controller {
     inner: Inner,
     status: Option<(crate::control::Hub, String)>,
     paused: Option<Arc<AtomicBool>>,
+    enabled: Option<Arc<AtomicBool>>,
+    additional: Vec<Controller>,
 }
 
 impl Controller {
@@ -54,6 +56,8 @@ impl Controller {
             inner: Inner::Adaptive(controller),
             status: None,
             paused: None,
+            enabled: None,
+            additional: Vec::new(),
         }
     }
 
@@ -62,7 +66,19 @@ impl Controller {
             inner: Inner::Manual(controller),
             status: None,
             paused: None,
+            enabled: None,
+            additional: Vec::new(),
         }
+    }
+
+    pub fn with_additional(mut self, controllers: Vec<Controller>) -> Self {
+        self.additional = controllers;
+        self
+    }
+
+    pub fn with_enabled(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.enabled = Some(enabled);
+        self
     }
 
     pub fn with_status(
@@ -77,19 +93,46 @@ impl Controller {
     }
 
     pub async fn adjust(&mut self, luma: u8) {
-        if self
-            .paused
-            .as_ref()
-            .is_some_and(|paused| paused.load(Ordering::Relaxed))
-        {
+        if !self.can_adjust() {
             return;
         }
         if let Some((status, output)) = &self.status {
             status.set_luma(output, luma);
         }
+        self.adjust_inner(luma).await;
+        for controller in &mut self.additional {
+            if controller.can_adjust() {
+                controller.adjust_inner(luma).await;
+            } else if !controller.is_enabled() {
+                controller.discard_inputs().await;
+            }
+        }
+    }
+
+    fn can_adjust(&self) -> bool {
+        !self
+            .paused
+            .as_ref()
+            .is_some_and(|paused| paused.load(Ordering::Relaxed))
+            && self.is_enabled()
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+            .as_ref()
+            .is_none_or(|enabled| enabled.load(Ordering::Relaxed))
+    }
+
+    async fn adjust_inner(&mut self, luma: u8) {
         match &mut self.inner {
             Inner::Adaptive(c) => c.adjust(luma).await,
             Inner::Manual(c) => c.adjust(luma).await,
+        }
+    }
+
+    async fn discard_inputs(&mut self) {
+        if let Inner::Adaptive(controller) = &mut self.inner {
+            controller.discard_inputs().await;
         }
     }
 }

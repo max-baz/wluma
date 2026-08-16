@@ -118,7 +118,7 @@ impl Controller {
             .saturating_sub(brightness_reduction);
 
         log::trace!(
-            "[{}] Prediction: {prediction} (als: {als}, luma: {luma})",
+            "[{}] Prediction: brightness={prediction} (als: {als}, luma: {luma})",
             self.output_name
         );
         self.prediction_tx

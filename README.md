@@ -133,7 +133,7 @@ gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
 
 The entire `output` section is optional. Wluma continuously discovers connected DRM outputs, associates internal panels with `/sys/class/backlight` devices and external monitors with DDC using their EDID, and automatically selects a screen capturer. Automatically discovered outputs and keyboards are started and stopped as they appear and disappear. DDC is known to often be problematic, so always consider trying [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
 
-To override the capturer or predictor for a discovered output, use the detected brightness type and DRM connector name reported with `RUST_LOG=debug`:
+To override the capturer, predictor or gamma control for a discovered output, use the detected brightness type and DRM connector name reported with `RUST_LOG=debug`:
 
 ```toml
 [[output.ddcutil]]
@@ -164,6 +164,26 @@ vulkan_device = "/dev/dri/renderD128"
 Run `wluma` with `RUST_LOG=debug` and find the `Discovered Vulkan device` entry for the GPU you want to use. Set `vulkan_device` to its `DRM render device` path, such as `/dev/dri/renderD128`; do not use the `DRM primary device` path.
 
 When the ScreenCast portal is used, select the monitor matching the configured output on the first run. wluma asks the portal to persist this selection and stores its restore token in the XDG state directory, so supported portal backends can restore it without prompting after restart. A separate portal session and restore token are used for each configured output.
+
+### Dimming and color temperature
+
+On supported wlroots compositors, Hyprland and GNOME, wluma can also learn and adjust per-output dimming and color temperature. Dimming ranges from 0% to 100%, and color temperature from 1000K to 25000K (6500K is neutral). Dimming is learned from both ambient light and screen luma; color temperature is learned from ambient light only, avoiding color shifts as screen content changes.
+
+```sh
+wluma set dim DP-1 20%
+wluma set dim DP-1 +5%
+wluma set temperature DP-1 4500K
+wluma set temperature DP-1 +500K
+wluma set temperature DP-1 neutral
+```
+
+Wayland gamma control is exclusive, so wluma cannot share an output with Gammastep, wlsunset or another gamma-control client. Wluma continues without these features when gamma control is unavailable. To prevent wluma from acquiring gamma control for an output, set `gamma = false` in its `output.backlight` or `output.ddcutil` entry:
+
+```toml
+[[output.backlight]]
+name = "eDP-1"
+gamma = false
+```
 
 ### Keyboards
 
