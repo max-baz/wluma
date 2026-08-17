@@ -872,7 +872,7 @@ mod tests {
         hub.set_luma("DP-1", 16);
         hub.set_brightness("DP-1", 99);
         hub.set_pause("DP-1", false, true);
-        hub.add_output("dell::kbd_backlight", "backlight", None);
+        hub.add_output("dell::kbd_backlight", "keyboard", None);
         hub.set_brightness("dell::kbd_backlight", 0);
 
         assert_eq!(
@@ -883,9 +883,9 @@ mod tests {
              POWER SOURCE  IDLE STATE  ENABLED  TIMEOUT  BRIGHTNESS\n\
              battery       idle        yes      120s     30%\n\
              \n\
-             OUTPUT               TYPE       CAPTURER  LUMA  BRIGHTNESS  DIM  TEMPERATURE  STATE\n\
-             DP-1                 ddc        wayland   16%   99%         -    -            idle\n\
-             dell::kbd_backlight  backlight  -         -     0%          -    -            active"
+             OUTPUT               TYPE      CAPTURER  LUMA  BRIGHTNESS  DIM  TEMPERATURE  STATE\n\
+             DP-1                 ddc       wayland   16%   99%         -    -            idle\n\
+             dell::kbd_backlight  keyboard  -         -     0%          -    -            active"
         );
     }
 }

@@ -500,6 +500,7 @@ impl Session {
 
         let keyboard = is_keyboard(&output);
         let kind = match &output {
+            config::Output::Backlight(_) if keyboard => "keyboard",
             config::Output::Backlight(_) => "backlight",
             config::Output::DdcUtil(_) => "ddc",
         };
