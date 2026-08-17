@@ -28,20 +28,7 @@ impl Backend {
         let (serial, _, outputs, _, _, _): Resources = proxy
             .method_call(INTERFACE, "GetResources", ())
             .context("Mutter DisplayConfig is unavailable")?;
-        let exact = outputs.iter().find(|output| output.4 == output_name);
-        let matches = outputs
-            .iter()
-            .filter(|output| output.4.contains(output_name))
-            .collect::<Vec<_>>();
-        let output = exact
-            .or_else(|| (matches.len() == 1).then_some(matches[0]))
-            .ok_or_else(|| {
-                if matches.len() > 1 {
-                    anyhow!("Multiple Mutter outputs match '{output_name}'")
-                } else {
-                    anyhow!("Unable to match '{output_name}' to a Mutter output")
-                }
-            })?;
+        let output = find_output(&outputs, output_name)?;
         if output.2 < 0 {
             return Err(anyhow!("Mutter output '{output_name}' is inactive"));
         }
@@ -84,5 +71,64 @@ impl Drop for Backend {
             "SetCrtcGamma",
             (self.serial, self.crtc, red, green, blue),
         );
+    }
+}
+
+fn find_output<'a>(outputs: &'a [Output], output_name: &str) -> Result<&'a Output> {
+    if let Some(output) = outputs.iter().find(|output| output.4 == output_name) {
+        return Ok(output);
+    }
+
+    let mut matches = outputs
+        .iter()
+        .filter(|output| output.4.contains(output_name));
+    let Some(output) = matches.next() else {
+        return Err(anyhow!(
+            "Unable to match '{output_name}' to a Mutter output"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(anyhow!("Multiple Mutter outputs match '{output_name}'"));
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_output, Output};
+
+    fn output(name: &str) -> Output {
+        (
+            0,
+            0,
+            0,
+            vec![],
+            name.to_string(),
+            vec![],
+            vec![],
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn matches_exact_output_before_partial_matches() {
+        let outputs = [output("DP-1"), output("card0-DP-1")];
+
+        assert_eq!(find_output(&outputs, "DP-1").unwrap().4, "DP-1");
+    }
+
+    #[test]
+    fn matches_a_unique_partial_output_name() {
+        let outputs = [output("card0-DP-1"), output("card0-HDMI-1")];
+
+        assert_eq!(find_output(&outputs, "DP-1").unwrap().4, "card0-DP-1");
+    }
+
+    #[test]
+    fn rejects_missing_or_ambiguous_output_names() {
+        let outputs = [output("card0-DP-1"), output("card1-DP-1")];
+
+        assert!(find_output(&outputs, "eDP-1").is_err());
+        assert!(find_output(&outputs, "DP-1").is_err());
     }
 }
