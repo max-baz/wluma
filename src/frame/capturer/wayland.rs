@@ -154,9 +154,10 @@ impl Capturer {
         controller: Controller,
         vulkan_device: Option<&str>,
         active: Arc<AtomicBool>,
+        status: &crate::control::Hub,
     ) -> (Controller, Result<()>) {
         self.controller = Some(controller);
-        let result = self.run_inner(output_name, vulkan_device, active);
+        let result = self.run_inner(output_name, vulkan_device, active, status);
         (self.controller.take().unwrap(), result)
     }
 
@@ -165,6 +166,7 @@ impl Capturer {
         output_name: &str,
         vulkan_device: Option<&str>,
         active: Arc<AtomicBool>,
+        status: &crate::control::Hub,
     ) -> Result<()> {
         self.vulkan_device = vulkan_device.map(str::to_string);
         let connection =
@@ -267,6 +269,12 @@ impl Capturer {
                 Vulkan::new(None)
             }
             .context("Unable to initialize Vulkan for Wayland capture")?,
+        );
+        status.set_capturer(
+            output_name,
+            protocol_to_use
+                .actual_name()
+                .expect("the selected Wayland protocol is concrete"),
         );
 
         while active.load(Ordering::Relaxed) {

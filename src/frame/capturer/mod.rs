@@ -29,7 +29,6 @@ impl Capturer {
                 smol::unblock(move || {
                     let controller = match wayland::Capturer::supported_protocols() {
                         Ok(protocols) if !protocols.is_empty() => {
-                            status.set_capturer(&output, "wayland");
                             let mut controller = controller;
                             for protocol in protocols {
                                 log::debug!(
@@ -41,13 +40,17 @@ impl Capturer {
                                         controller,
                                         vulkan_device.as_deref(),
                                         active.clone(),
+                                        &status,
                                     );
                                 controller = returned_controller;
                                 match result {
                                     Ok(()) => return,
-                                    Err(error) => log::warn!(
-                                        "Wayland {protocol} screen capture failed for '{output}': {error:#}"
-                                    ),
+                                    Err(error) => {
+                                        status.set_capturer(&output, "initializing");
+                                        log::warn!(
+                                            "Wayland {protocol} screen capture failed for '{output}': {error:#}"
+                                        );
+                                    }
                                 }
                             }
                             log::debug!(
@@ -66,14 +69,18 @@ impl Capturer {
                     };
 
                     match pipewire::prepare(&output, crate::config::PipewireProtocol::Any) {
-                        Ok(source) => {
-                            status.set_capturer(&output, "pipewire");
-                            log::debug!("Auto capturer selected PipeWire for '{output}'");
+                        Ok(prepared) => {
+                            log::debug!(
+                                "Auto capturer selected {} for '{output}'",
+                                prepared.protocol
+                            );
                             let (controller, result) = pipewire::run_prepared(
-                                source,
+                                prepared,
                                 controller,
                                 vulkan_device.as_deref(),
                                 active.clone(),
+                                &status,
+                                &output,
                             );
                             if let Err(error) = result {
                                 status.set_capturer(&output, "none");
@@ -101,7 +108,6 @@ impl Capturer {
                 c.run(output_name, controller, active).await
             }
             Capturer::Pipewire(protocol) => {
-                status.set_capturer(output_name, "pipewire");
                 let output = output_name.to_string();
                 let vulkan_device = vulkan_device.map(str::to_string);
                 smol::unblock(move || {
@@ -111,17 +117,24 @@ impl Capturer {
                         controller,
                         vulkan_device.as_deref(),
                         active,
+                        status,
                     )
                 })
                 .await;
             }
             Capturer::Wayland(mut c) => {
-                status.set_capturer(output_name, "wayland");
                 let output = output_name.to_string();
                 let vulkan_device = vulkan_device.map(str::to_string);
                 smol::unblock(move || {
-                    let (_, result) = c.run(&output, controller, vulkan_device.as_deref(), active);
+                    let (_, result) = c.run(
+                        &output,
+                        controller,
+                        vulkan_device.as_deref(),
+                        active,
+                        &status,
+                    );
                     if let Err(error) = result {
+                        status.set_capturer(&output, "failed");
                         log::error!("Wayland screen capture failed for '{output}': {error:#}");
                     }
                 })

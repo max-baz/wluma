@@ -8,15 +8,20 @@ pub enum WaylandProtocol {
     WlrExportDmabufUnstableV1,
 }
 
+impl WaylandProtocol {
+    pub const fn actual_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Any => None,
+            Self::ExtImageCopyCaptureV1 => Some("ext-image-copy-capture-v1"),
+            Self::WlrScreencopyUnstableV1 => Some("wlr-screencopy-unstable-v1"),
+            Self::WlrExportDmabufUnstableV1 => Some("wlr-export-dmabuf-unstable-v1"),
+        }
+    }
+}
+
 impl fmt::Display for WaylandProtocol {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let output = match self {
-            Self::Any => "any",
-            Self::ExtImageCopyCaptureV1 => "ext-image-copy-capture-v1",
-            Self::WlrScreencopyUnstableV1 => "wlr-screencopy-unstable-v1",
-            Self::WlrExportDmabufUnstableV1 => "wlr-export-dmabuf-unstable-v1",
-        };
-        write!(f, "{}", output)
+        f.write_str(self.actual_name().unwrap_or("any"))
     }
 }
 
@@ -26,6 +31,23 @@ pub enum PipewireProtocol {
     Portal,
     Kwin,
     Mutter,
+}
+
+impl PipewireProtocol {
+    pub const fn actual_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Any => None,
+            Self::Portal => Some("xdg-desktop-portal-screencast"),
+            Self::Kwin => Some("zkde-screencast-unstable-v1"),
+            Self::Mutter => Some("gnome-mutter-screencast"),
+        }
+    }
+}
+
+impl fmt::Display for PipewireProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.actual_name().unwrap_or("any"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,7 +221,43 @@ pub struct Config {
 
 #[cfg(test)]
 mod tests {
-    use super::VulkanDevice;
+    use super::{PipewireProtocol, VulkanDevice, WaylandProtocol};
+
+    #[test]
+    fn names_actual_capture_protocols() {
+        let protocols = [
+            (
+                WaylandProtocol::ExtImageCopyCaptureV1.actual_name(),
+                "ext-image-copy-capture-v1",
+            ),
+            (
+                WaylandProtocol::WlrScreencopyUnstableV1.actual_name(),
+                "wlr-screencopy-unstable-v1",
+            ),
+            (
+                WaylandProtocol::WlrExportDmabufUnstableV1.actual_name(),
+                "wlr-export-dmabuf-unstable-v1",
+            ),
+            (
+                PipewireProtocol::Portal.actual_name(),
+                "xdg-desktop-portal-screencast",
+            ),
+            (
+                PipewireProtocol::Kwin.actual_name(),
+                "zkde-screencast-unstable-v1",
+            ),
+            (
+                PipewireProtocol::Mutter.actual_name(),
+                "gnome-mutter-screencast",
+            ),
+        ];
+
+        assert_eq!(WaylandProtocol::Any.actual_name(), None);
+        assert_eq!(PipewireProtocol::Any.actual_name(), None);
+        for (actual_name, expected) in protocols {
+            assert_eq!(actual_name, Some(expected));
+        }
+    }
 
     #[test]
     fn formats_automatic_vulkan_device_for_config_dump() {

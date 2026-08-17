@@ -494,10 +494,8 @@ impl Session {
             config::Output::DdcUtil(_) => "ddc",
         };
         let capturer_name = match &capturer {
-            config::Capturer::Auto => "auto",
-            config::Capturer::Wayland(_) => "wayland",
-            config::Capturer::Pipewire(_) => "pipewire",
             config::Capturer::None => "none",
+            _ => "initializing",
         };
         status.add_output(&name, kind, (!keyboard).then_some(capturer_name));
 
