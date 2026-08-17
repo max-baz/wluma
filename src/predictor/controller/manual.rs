@@ -121,10 +121,8 @@ impl Controller {
             "[{}] Prediction: brightness={prediction} (als: {als}, luma: {luma})",
             self.output_name
         );
-        self.prediction_tx
-            .send(prediction)
-            .await
-            .expect("Unable to send predicted brightness value, channel is dead");
+        // The receiver can disappear while an output is shutting down.
+        let _ = self.prediction_tx.send(prediction).await;
     }
 
     fn get_brightness_reduction(&mut self, current_brightness: u64, als: u64, luma: u8) -> u64 {

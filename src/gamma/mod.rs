@@ -48,10 +48,32 @@ impl Backend {
         }
     }
 
+    fn initialize(&mut self) -> Result<Values> {
+        match self {
+            // Acquiring the Wayland protocol does not provide an existing LUT.
+            Self::Wayland(backend) => {
+                backend.set(0, ramp::NEUTRAL_TEMPERATURE)?;
+                Ok(Values::neutral())
+            }
+            // Mutter's LUT is already active. Leaving it untouched also avoids
+            // a flash before the first absolute transition begins.
+            Self::Mutter(backend) => {
+                let (dim, temperature) = backend.initial();
+                Ok(Values { dim, temperature })
+            }
+        }
+    }
+
     fn set(&mut self, dim: u64, temperature: u64) -> Result<()> {
         match self {
             Self::Wayland(backend) => backend.set(dim, temperature),
             Self::Mutter(backend) => backend.set(dim, temperature),
+        }
+    }
+
+    fn preserve_current(&mut self) {
+        if let Self::Mutter(backend) = self {
+            backend.preserve_current();
         }
     }
 
@@ -87,6 +109,7 @@ pub struct Controller {
     last_attempt: Option<Instant>,
     current: Values,
     target: Values,
+    target_initialized: bool,
     transition: Option<Transition>,
     dim_user: Sender<u64>,
     temperature_user: Sender<u64>,
@@ -107,6 +130,7 @@ pub struct Command {
 pub enum CommandAction {
     Get(crate::control::Property),
     Set(crate::control::Property, crate::control::ValueAdjustment),
+    Restore,
 }
 
 impl Controller {
@@ -122,6 +146,7 @@ impl Controller {
             last_attempt: None,
             current: Values::neutral(),
             target: Values::neutral(),
+            target_initialized: false,
             transition: None,
             dim_user: inputs.dim_user,
             temperature_user: inputs.temperature_user,
@@ -177,20 +202,24 @@ impl Controller {
         }
         self.last_attempt = Some(Instant::now());
         let output = self.output.clone();
-        let current = self.current;
         let result = smol::unblock(move || {
             let mut backend = Backend::new(&output).map_err(ConnectError::Backend)?;
-            backend
-                .set(current.dim, current.temperature)
-                .map_err(ConnectError::Initialize)?;
-            Ok(backend)
+            let current = backend.initialize().map_err(ConnectError::Initialize)?;
+            Ok((backend, current))
         })
         .await;
         match result {
-            Ok(backend) => {
+            Ok((backend, current)) => {
                 log::debug!("Acquired gamma control for '{}'", self.output);
+                self.current = current;
                 self.backend = Some(backend);
                 self.available.store(true, Ordering::Relaxed);
+                // Until a command or prediction provides a target, retain the
+                // LUT that Mutter already has instead of flashing to neutral.
+                if !self.target_initialized {
+                    self.target = current;
+                    self.target_initialized = true;
+                }
                 if self.current != self.target {
                     self.transition = Some(Transition {
                         from: self.current,
@@ -280,6 +309,26 @@ impl Controller {
                 }
                 Ok(value)
             }
+            CommandAction::Restore => {
+                self.set_target(Values::neutral());
+                while self.transition.is_some() {
+                    self.advance().await?;
+                    if self.transition.is_some() {
+                        let interval = self
+                            .backend
+                            .as_ref()
+                            .map_or(IDLE_INTERVAL, Backend::transition_interval);
+                        smol::Timer::after(interval).await;
+                    }
+                }
+                // Always write the neutral LUT. An estimated initial value can
+                // round to neutral even when its channel gains are slightly off.
+                self.apply(Values::neutral()).await?;
+                if let Some(backend) = &mut self.backend {
+                    backend.preserve_current();
+                }
+                Ok(ramp::NEUTRAL_TEMPERATURE)
+            }
         }
     }
 
@@ -292,6 +341,7 @@ impl Controller {
     }
 
     fn set_target(&mut self, target: Values) {
+        self.target_initialized = true;
         if target == self.target {
             return;
         }

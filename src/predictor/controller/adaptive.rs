@@ -329,10 +329,8 @@ impl Controller {
                 self.kind.name(),
                 self.kind.unit()
             );
-            self.prediction_tx
-                .send(prediction)
-                .await
-                .expect("Unable to send predicted brightness value, channel is dead");
+            // The receiver can disappear while an output is shutting down.
+            let _ = self.prediction_tx.send(prediction).await;
         }
     }
 }

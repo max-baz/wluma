@@ -19,6 +19,9 @@ pub struct Backend {
     serial: u32,
     crtc: u32,
     original: [Vec<u16>; 3],
+    base: [Vec<u16>; 3],
+    initial: (u64, u64),
+    restore_on_drop: bool,
 }
 
 impl Backend {
@@ -39,17 +42,35 @@ impl Backend {
         if red.is_empty() || red.len() != green.len() || red.len() != blue.len() {
             return Err(anyhow!("Mutter reported an invalid gamma LUT"));
         }
-        log::debug!("Using Mutter DisplayConfig gamma control for '{output_name}'");
+        let original = [red, green, blue];
+        let initial = ramp::estimate(&original);
+        let base = ramp::neutralize(&original);
+        log::debug!(
+            "Using Mutter DisplayConfig gamma control for '{output_name}' (initial dim: {}%, temperature: {}K)",
+            initial.0,
+            initial.1
+        );
         Ok(Self {
             connection,
             serial,
             crtc,
-            original: [red, green, blue],
+            original,
+            base,
+            initial,
+            restore_on_drop: true,
         })
     }
 
+    pub fn initial(&self) -> (u64, u64) {
+        self.initial
+    }
+
+    pub fn preserve_current(&mut self) {
+        self.restore_on_drop = false;
+    }
+
     pub fn set(&mut self, dim: u64, temperature: u64) -> Result<()> {
-        let [red, green, blue] = ramp::apply(&self.original, dim, temperature);
+        let [red, green, blue] = ramp::apply(&self.base, dim, temperature);
         let proxy = self.connection.with_proxy(DESTINATION, PATH, TIMEOUT);
         let _: () = proxy
             .method_call(
@@ -64,6 +85,9 @@ impl Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
+        if !self.restore_on_drop {
+            return;
+        }
         let proxy = self.connection.with_proxy(DESTINATION, PATH, TIMEOUT);
         let [red, green, blue] = self.original.clone();
         let _: Result<(), _> = proxy.method_call(

@@ -1,3 +1,5 @@
+use async_signal::{Signal, Signals};
+use futures_util::StreamExt;
 use macro_rules_attribute::apply;
 use smol::channel;
 
@@ -170,7 +172,15 @@ async fn main() {
         status,
         idle_config.zip(idle_rx),
     );
-    runtime.run().await;
+    let mut signals = Signals::new([Signal::Int, Signal::Quit, Signal::Term])
+        .expect("Unable to listen for shutdown signals");
+    smol::future::race(runtime.run(), async {
+        if let Some(signal) = signals.next().await {
+            log::debug!("Received shutdown signal: {signal:?}");
+        }
+    })
+    .await;
+    runtime.stop().await;
     drop(control_task);
     drop(als_task);
     drop(idle_task);

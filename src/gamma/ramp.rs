@@ -36,6 +36,68 @@ pub fn apply(base: &[Vec<u16>; 3], dim: u64, temperature: u64) -> [Vec<u16>; 3] 
     })
 }
 
+/// Removes the channel gains already present in a LUT while retaining each
+/// channel's transfer curve. This gives back a neutral base to which absolute
+/// dim and temperature values can be applied without compounding them.
+pub fn neutralize(base: &[Vec<u16>; 3]) -> [Vec<u16>; 3] {
+    let peaks = base
+        .each_ref()
+        .map(|channel| channel.iter().copied().max().unwrap_or_default() as f64);
+    let reference = peaks
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(channel, _)| channel)
+        .unwrap_or_default();
+
+    std::array::from_fn(|channel| {
+        let source = if peaks[channel] > 0.0 {
+            channel
+        } else {
+            reference
+        };
+        let peak = peaks[source];
+        if peak == 0.0 {
+            return linear(base[channel].len(), 0, NEUTRAL_TEMPERATURE)[channel].clone();
+        }
+        base[source]
+            .iter()
+            .map(|value| (*value as f64 / peak * u16::MAX as f64).round() as u16)
+            .collect()
+    })
+}
+
+/// Estimates the absolute controls represented by a LUT. The estimate is used
+/// only as the starting point of a transition; subsequent LUTs are generated
+/// from a neutralized base.
+pub fn estimate(base: &[Vec<u16>; 3]) -> (u64, u64) {
+    let peaks = base
+        .each_ref()
+        .map(|channel| channel.iter().copied().max().unwrap_or_default() as f64);
+    let peak = peaks.iter().copied().fold(0.0_f64, f64::max);
+    if peak == 0.0 {
+        return (100, NEUTRAL_TEMPERATURE);
+    }
+
+    let observed = peaks.map(|value| value / peak);
+    let temperature = (MIN_TEMPERATURE..=MAX_TEMPERATURE)
+        .min_by(|left, right| {
+            let error = |temperature| {
+                gains(0, temperature)
+                    .into_iter()
+                    .zip(observed)
+                    .map(|(expected, actual)| (expected - actual).powi(2))
+                    .sum::<f64>()
+            };
+            error(*left).total_cmp(&error(*right))
+        })
+        .unwrap_or(NEUTRAL_TEMPERATURE);
+    let dim = (100.0 * (1.0 - peak / u16::MAX as f64))
+        .round()
+        .clamp(0.0, 100.0) as u64;
+    (dim, temperature)
+}
+
 fn raw_temperature(kelvin: f64) -> [f64; 3] {
     let value = kelvin / 100.0;
     let red = if value <= 66.0 {
@@ -78,5 +140,34 @@ mod tests {
         assert_eq!(gains[0], 1.0);
         assert!(gains[1] < gains[0]);
         assert!(gains[2] < gains[1]);
+    }
+
+    #[test]
+    fn neutralizes_existing_channel_gains() {
+        let base = [vec![0, 100, 200], vec![0, 50, 100], vec![0, 25, 50]];
+        let neutral = neutralize(&base);
+
+        assert_eq!(neutral[0], vec![0, 32768, 65535]);
+        assert_eq!(neutral[1], neutral[0]);
+        assert_eq!(neutral[2], neutral[0]);
+    }
+
+    #[test]
+    fn estimates_generated_controls() {
+        let existing = linear(256, 20, 4500);
+
+        assert_eq!(estimate(&existing), (20, 4500));
+    }
+
+    #[test]
+    fn applying_to_neutralized_lut_does_not_compound_temperature() {
+        let existing = linear(256, 0, 4500);
+        let reapplied = apply(&neutralize(&existing), 0, 4500);
+
+        for channel in 0..3 {
+            for (actual, expected) in reapplied[channel].iter().zip(&existing[channel]) {
+                assert!(actual.abs_diff(*expected) <= 1);
+            }
+        }
     }
 }

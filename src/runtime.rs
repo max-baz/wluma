@@ -1,5 +1,6 @@
 use crate::{als, brightness, config, frame, gamma, idle, predictor};
 use anyhow::Result;
+use futures_util::future::join_all;
 use smol::channel::{self, Receiver, Sender};
 use smol::Task;
 use std::collections::HashMap;
@@ -105,6 +106,15 @@ impl Runtime {
                 Event::Tick => self.step().await,
             }
         }
+    }
+
+    pub async fn stop(&mut self) {
+        let sessions = self
+            .sessions
+            .drain()
+            .map(|(_, session)| session.stop())
+            .collect::<Vec<_>>();
+        join_all(sessions).await;
     }
 
     async fn idle_event(&mut self, event: idle::Event) {
@@ -649,12 +659,41 @@ impl Session {
     }
 
     async fn stop(self) {
+        // Stop prediction producers before their receivers. Otherwise a final
+        // frame can race with controller cancellation and send into a closed
+        // channel during graceful shutdown.
         self.active.store(false, Ordering::Relaxed);
+        self.capturer.await;
+
+        if let Some(commands) = &self.gamma_commands {
+            let (response_tx, response_rx) = channel::bounded(1);
+            let result: Result<Result<u64, String>, String> = async {
+                commands
+                    .send(gamma::Command {
+                        action: gamma::CommandAction::Restore,
+                        response: response_tx,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                response_rx.recv().await.map_err(|error| error.to_string())
+            }
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => log::debug!(
+                    "Unable to restore neutral gamma for '{}': {error}",
+                    output_name(&self.output)
+                ),
+                Err(error) => log::debug!(
+                    "Gamma controller for '{}' stopped before restoration: {error}",
+                    output_name(&self.output)
+                ),
+            }
+        }
         self.brightness.cancel().await;
         if let Some(gamma) = self.gamma {
             gamma.cancel().await;
         }
-        self.capturer.await;
     }
 }
 
