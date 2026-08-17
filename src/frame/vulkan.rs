@@ -6,7 +6,7 @@ use ash::khr::external_memory_fd::Device as KHRDevice;
 use ash::{vk, Device, Entry, Instance};
 use drm_fourcc::DrmFourcc;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::default::Default;
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -18,6 +18,7 @@ const VULKAN_VERSION: u32 = vk::make_api_version(0, 1, 2, 0);
 
 const FINAL_MIP_LEVEL: u32 = 4; // Don't generate mipmaps beyond this level - GPU is doing too poor of a job averaging the colors
 const FENCES_TIMEOUT_NS: u64 = 1_000_000_000;
+const IMPORTED_FRAME_CACHE_SIZE: usize = 8;
 
 pub struct Vulkan {
     _entry: Entry, // must keep reference to prevent early memory release
@@ -36,7 +37,10 @@ pub struct Vulkan {
     fence: vk::Fence,
     image: Option<vk::Image>,
     image_memory: Option<vk::DeviceMemory>,
-    image_resolution: Option<(u32, u32, u32)>,
+    image_properties: Option<(u32, u32, u32, vk::Format)>,
+    converted_image: Option<vk::Image>,
+    converted_image_memory: Option<vk::DeviceMemory>,
+    imported_frames: VecDeque<ImportedFrame>,
     exportable_frame_image: Option<vk::Image>,
     exportable_frame_image_memory: Option<vk::DeviceMemory>,
     exportable_frame_image_fd: Option<OwnedFd>,
@@ -57,6 +61,23 @@ impl DrmDevice {
             .map(|name| format!("/dev/dri/{name} ({}:{})", self.major, self.minor))
             .unwrap_or_else(|| format!("{}:{}", self.major, self.minor))
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ImportedFrameKey {
+    device: u64,
+    inode: u64,
+    width: u32,
+    height: u32,
+    format: u32,
+    layout: Option<(u64, u32, u32)>,
+    size: u32,
+}
+
+struct ImportedFrame {
+    key: ImportedFrameKey,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
 }
 
 struct Candidate {
@@ -213,9 +234,9 @@ impl Vulkan {
                 )
             }
             .optimal_tiling_features;
-            let required_format_features = vk::FormatFeatureFlags::BLIT_SRC
-                | vk::FormatFeatureFlags::BLIT_DST
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+            let required_format_features = vk::FormatFeatureFlags::TRANSFER_SRC
+                | vk::FormatFeatureFlags::TRANSFER_DST
+                | vk::FormatFeatureFlags::BLIT_DST;
             if !format_features.contains(required_format_features) {
                 log::debug!("Ignoring Vulkan device '{name}': internal image format does not support the required blit operations");
                 continue;
@@ -368,7 +389,10 @@ impl Vulkan {
             fence,
             image: None,
             image_memory: None,
-            image_resolution: None,
+            image_properties: None,
+            converted_image: None,
+            converted_image_memory: None,
+            imported_frames: VecDeque::new(),
             buffer: None,
             buffer_memory: None,
             exportable_frame_image: None,
@@ -432,9 +456,7 @@ impl Vulkan {
             );
         }
 
-        let required_format_features = vk::FormatFeatureFlags::TRANSFER_SRC
-            | vk::FormatFeatureFlags::BLIT_SRC
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        let required_format_features = vk::FormatFeatureFlags::TRANSFER_SRC;
         let mut supported = Vec::new();
         for modifier in modifiers {
             if self.supports_dma_buf_modifier(
@@ -515,16 +537,46 @@ impl Vulkan {
     }
 
     pub fn luma_percent_from_external_fd(&mut self, frame: &Object) -> Result<u8> {
-        let (frame_image, frame_image_memory) = self.init_frame_image(frame)?;
-
-        let result = self.luma_percent(&frame_image);
-
-        unsafe {
-            self.device.destroy_image(frame_image, None);
-            self.device.free_memory(frame_image_memory, None);
+        if frame.num_objects != 1 {
+            return Err(anyhow!(
+                "Frames with multiple objects are not supported yet, use WLR_DRM_NO_MODIFIERS=1 as described in README and follow issue #8"
+            ));
         }
+        self.init_image(frame)?;
+        let metadata = File::from(frame.fd(0).try_clone()?).metadata()?;
+        let key = ImportedFrameKey {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            width: frame.width,
+            height: frame.height,
+            format: frame.format,
+            layout: frame.layout,
+            size: frame.sizes[0],
+        };
+        let frame_image = if let Some(index) = self
+            .imported_frames
+            .iter()
+            .position(|imported| imported.key == key)
+        {
+            let imported = self.imported_frames.remove(index).unwrap();
+            let image = imported.image;
+            self.imported_frames.push_back(imported);
+            image
+        } else {
+            let (image, memory) = self.init_frame_image(frame)?;
+            if self.imported_frames.len() == IMPORTED_FRAME_CACHE_SIZE {
+                let imported = self.imported_frames.pop_front().unwrap();
+                unsafe {
+                    self.device.destroy_image(imported.image, None);
+                    self.device.free_memory(imported.memory, None);
+                }
+            }
+            self.imported_frames
+                .push_back(ImportedFrame { key, image, memory });
+            image
+        };
 
-        result
+        self.luma_percent(&frame_image)
     }
 
     pub fn luma_percent_from_internal_fd(&mut self) -> Result<u8> {
@@ -558,7 +610,7 @@ impl Vulkan {
 
         let (target_mip_level, mip_width, mip_height) = self.generate_mipmaps(frame_image, &image);
 
-        self.copy_mipmap(&image, target_mip_level, mip_width, mip_height)?;
+        self.convert_and_copy_mipmap(&image, target_mip_level, mip_width, mip_height)?;
 
         self.submit_commands()?;
 
@@ -586,20 +638,40 @@ impl Vulkan {
     }
 
     fn init_image(&mut self, frame: &Object) -> Result<()> {
-        let mip_levels = f64::max(frame.width.into(), frame.height.into())
-            .log2()
-            .floor() as u32;
+        let max_dimension = frame.width.max(frame.height);
+        if max_dimension == 0 {
+            return Err(anyhow!("Vulkan images must have non-zero dimensions"));
+        }
+        let max_mip_level = max_dimension.ilog2();
+        let mip_levels = max_mip_level + 1;
+        let format = map_drm_format(frame.format)?;
 
-        if let Some((w, h, _)) = self.image_resolution {
-            if (w, h) == (frame.width, frame.height) {
-                // Image is already initialized, resolution did not change
+        if let Some((w, h, _, current_format)) = self.image_properties {
+            if (w, h, current_format) == (frame.width, frame.height, format) {
                 return Ok(());
             }
         }
 
+        let format_features = unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical_device, format)
+        }
+        .optimal_tiling_features;
+        let required_format_features = vk::FormatFeatureFlags::TRANSFER_DST
+            | vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::BLIT_SRC
+            | vk::FormatFeatureFlags::BLIT_DST
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        if !format_features.contains(required_format_features) {
+            return Err(anyhow!(
+                "Vulkan format {} does not support the required optimal-image transfer operations",
+                format.as_raw()
+            ));
+        }
+
         let image_create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(format)
             .extent(vk::Extent3D {
                 width: frame.width,
                 height: frame.height,
@@ -658,9 +730,10 @@ impl Vulkan {
             }
         }
 
-        let buffer_size = 4
-            * (frame.width >> (mip_levels - FINAL_MIP_LEVEL))
-            * (frame.height >> (mip_levels - FINAL_MIP_LEVEL));
+        let target_mip_level = max_mip_level.saturating_sub(FINAL_MIP_LEVEL);
+        let converted_width = (frame.width >> target_mip_level).max(1);
+        let converted_height = (frame.height >> target_mip_level).max(1);
+        let buffer_size = 4 * converted_width * converted_height;
 
         let buffer_info = vk::BufferCreateInfo::default()
             .size(buffer_size as u64)
@@ -680,7 +753,7 @@ impl Vulkan {
                 .get_physical_device_memory_properties(self.physical_device)
         };
 
-        let memory_type_index = find_memory_type_index(
+        let buffer_memory_type_index = find_memory_type_index(
             &buffer_memory_req,
             &device_memory_properties,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
@@ -691,7 +764,7 @@ impl Vulkan {
 
         let allocate_info = vk::MemoryAllocateInfo {
             allocation_size: buffer_memory_req.size,
-            memory_type_index,
+            memory_type_index: buffer_memory_type_index,
             ..Default::default()
         };
 
@@ -718,8 +791,61 @@ impl Vulkan {
             }
         }
 
-        self.image_resolution
-            .replace((frame.width, frame.height, mip_levels));
+        let converted_image_create_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width: converted_width,
+                height: converted_height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let converted_image = unsafe {
+            self.device
+                .create_image(&converted_image_create_info, None)
+                .map_err(anyhow::Error::msg)?
+        };
+        let converted_memory_req =
+            unsafe { self.device.get_image_memory_requirements(converted_image) };
+        let converted_memory_type_index = find_memory_type_index(
+            &converted_memory_req,
+            &device_memory_properties,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| {
+            memory_type_index(converted_memory_req.memory_type_bits, "converted image").ok()
+        })
+        .ok_or(anyhow!(
+            "No Vulkan memory type supports the converted image"
+        ))?;
+        let converted_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(converted_memory_req.size)
+            .memory_type_index(converted_memory_type_index);
+        let converted_image_memory = unsafe {
+            self.device
+                .allocate_memory(&converted_allocate_info, None)
+                .map_err(anyhow::Error::msg)?
+        };
+        unsafe {
+            self.device
+                .bind_image_memory(converted_image, converted_image_memory, 0)
+                .map_err(anyhow::Error::msg)?
+        }
+        if let Some(old_image) = self.converted_image.replace(converted_image) {
+            unsafe { self.device.destroy_image(old_image, None) }
+        }
+        if let Some(old_memory) = self.converted_image_memory.replace(converted_image_memory) {
+            unsafe { self.device.free_memory(old_memory, None) }
+        }
+
+        self.image_properties
+            .replace((frame.width, frame.height, mip_levels, format));
 
         Ok(())
     }
@@ -730,10 +856,21 @@ impl Vulkan {
                 "Vulkan device does not support DRM format modifiers"
             ));
         }
-        assert_eq!(
-            1, frame.num_objects,
-            "Frames with multiple objects are not supported yet, use WLR_DRM_NO_MODIFIERS=1 as described in README and follow issue #8"
-        );
+
+        let format = map_drm_format(frame.format)?;
+        if frame.layout.is_none() {
+            let format_features = unsafe {
+                self.instance
+                    .get_physical_device_format_properties(self.physical_device, format)
+            }
+            .linear_tiling_features;
+            if !format_features.contains(vk::FormatFeatureFlags::TRANSFER_SRC) {
+                return Err(anyhow!(
+                    "Vulkan format {} does not support linear images as transfer sources",
+                    format.as_raw()
+                ));
+            }
+        }
 
         // External memory info
         let mut frame_image_memory_info = vk::ExternalMemoryImageCreateInfo::default()
@@ -768,7 +905,7 @@ impl Vulkan {
         let mut frame_image_create_info = vk::ImageCreateInfo::default()
             .push_next(&mut frame_image_memory_info)
             .image_type(vk::ImageType::TYPE_2D)
-            .format(map_drm_format(frame.format)?)
+            .format(format)
             .extent(vk::Extent3D {
                 width: frame.width,
                 height: frame.height,
@@ -815,15 +952,6 @@ impl Vulkan {
                 self.device.free_memory(frame_image_memory, None);
             }
             return Err(anyhow::Error::msg(error));
-        }
-
-        // Also ensure the internal image is initialized with the same dimensions
-        if let Err(error) = self.init_image(frame) {
-            unsafe {
-                self.device.destroy_image(frame_image, None);
-                self.device.free_memory(frame_image_memory, None);
-            }
-            return Err(error);
         }
 
         Ok((frame_image, frame_image_memory))
@@ -1222,8 +1350,46 @@ impl Vulkan {
         }
     }
 
+    fn copy_image(
+        &self,
+        src_image: &vk::Image,
+        dst_image: &vk::Image,
+        width: u32,
+        height: u32,
+        dst_mip_level: u32,
+    ) {
+        let copy = vk::ImageCopy::default()
+            .src_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .dst_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(dst_mip_level)
+                    .layer_count(1),
+            )
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+
+        unsafe {
+            self.device.cmd_copy_image(
+                self.command_buffers[0],
+                *src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                *dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+        }
+    }
+
     fn generate_mipmaps(&self, frame_image: &vk::Image, image: &vk::Image) -> (u32, u32, u32) {
-        let (mut mip_width, mut mip_height, mip_levels) = self.image_resolution.unwrap();
+        let (mut mip_width, mut mip_height, mip_levels, _) = self.image_properties.unwrap();
 
         self.add_barrier(
             image,
@@ -1236,18 +1402,9 @@ impl Vulkan {
             vk::PipelineStageFlags::TOP_OF_PIPE,
         );
 
-        self.blit(
-            frame_image,
-            mip_width,
-            mip_height,
-            0,
-            image,
-            mip_width,
-            mip_height,
-            0,
-        );
+        self.copy_image(frame_image, image, mip_width, mip_height, 0);
 
-        let target_mip_level = mip_levels - FINAL_MIP_LEVEL;
+        let target_mip_level = (mip_levels - 1).saturating_sub(FINAL_MIP_LEVEL);
         for i in 1..=target_mip_level {
             self.add_barrier(
                 image,
@@ -1281,7 +1438,7 @@ impl Vulkan {
         (target_mip_level, mip_width, mip_height)
     }
 
-    fn copy_mipmap(
+    fn convert_and_copy_mipmap(
         &self,
         image: &vk::Image,
         mip_level: u32,
@@ -1299,11 +1456,44 @@ impl Vulkan {
             vk::PipelineStageFlags::TRANSFER,
         );
 
+        let converted_image = self
+            .converted_image
+            .ok_or(anyhow!("Unable to borrow the converted image"))?;
+        self.add_barrier(
+            &converted_image,
+            0,
+            1,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::default(),
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        );
+        self.blit(
+            image,
+            width,
+            height,
+            mip_level,
+            &converted_image,
+            width,
+            height,
+            0,
+        );
+        self.add_barrier(
+            &converted_image,
+            0,
+            1,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+        );
+
         let buffer_image_copy = vk::BufferImageCopy::default()
             .image_subresource(
                 vk::ImageSubresourceLayers::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .mip_level(mip_level)
                     .layer_count(1),
             )
             .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
@@ -1318,7 +1508,7 @@ impl Vulkan {
         unsafe {
             self.device.cmd_copy_image_to_buffer(
                 self.command_buffers[0],
-                *image,
+                converted_image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 buffer,
                 &[buffer_image_copy],
@@ -1329,6 +1519,14 @@ impl Vulkan {
     }
 
     fn begin_commands(&self) -> Result<()> {
+        unsafe {
+            self.device
+                .reset_command_buffer(
+                    self.command_buffers[0],
+                    vk::CommandBufferResetFlags::empty(),
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
         let command_buffer_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
@@ -1384,6 +1582,16 @@ impl Drop for Vulkan {
             }
             if let Some(image_memory) = self.image_memory {
                 self.device.free_memory(image_memory, None);
+            }
+            if let Some(image) = self.converted_image {
+                self.device.destroy_image(image, None);
+            }
+            if let Some(image_memory) = self.converted_image_memory {
+                self.device.free_memory(image_memory, None);
+            }
+            for imported in self.imported_frames.drain(..) {
+                self.device.destroy_image(imported.image, None);
+                self.device.free_memory(imported.memory, None);
             }
             if let Some(image) = self.exportable_frame_image {
                 self.device.destroy_image(image, None);
@@ -1445,10 +1653,37 @@ fn map_drm_format(format: u32) -> Result<vk::Format> {
         DrmFourcc::Xbgr2101010 => Ok(vk::Format::A2B10G10R10_UNORM_PACK32),
         DrmFourcc::Xbgr16161616f => Ok(vk::Format::R16G16B16A16_SFLOAT),
         DrmFourcc::Xbgr8888 => Ok(vk::Format::R8G8B8A8_UNORM),
-        DrmFourcc::Bgrx8888 => Ok(vk::Format::B8G8R8A8_UNORM),
         DrmFourcc::Xrgb8888 => Ok(vk::Format::B8G8R8A8_UNORM),
         _ => Err(anyhow!(
             "Unsupported DRM format: {format}. Please report on GitHub."
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_drm_formats_without_changing_component_order() {
+        let mappings = [
+            (DrmFourcc::Rgbx4444, vk::Format::R4G4B4A4_UNORM_PACK16),
+            (DrmFourcc::Bgrx4444, vk::Format::B4G4R4A4_UNORM_PACK16),
+            (DrmFourcc::Rgb565, vk::Format::R5G6B5_UNORM_PACK16),
+            (DrmFourcc::Bgr565, vk::Format::B5G6R5_UNORM_PACK16),
+            (DrmFourcc::Xrgb1555, vk::Format::A1R5G5B5_UNORM_PACK16),
+            (DrmFourcc::Rgbx5551, vk::Format::R5G5B5A1_UNORM_PACK16),
+            (DrmFourcc::Bgrx5551, vk::Format::B5G5R5A1_UNORM_PACK16),
+            (DrmFourcc::Xrgb2101010, vk::Format::A2R10G10B10_UNORM_PACK32),
+            (DrmFourcc::Xbgr2101010, vk::Format::A2B10G10R10_UNORM_PACK32),
+            (DrmFourcc::Xbgr16161616f, vk::Format::R16G16B16A16_SFLOAT),
+            (DrmFourcc::Xbgr8888, vk::Format::R8G8B8A8_UNORM),
+            (DrmFourcc::Xrgb8888, vk::Format::B8G8R8A8_UNORM),
+        ];
+
+        for (drm, vulkan) in mappings {
+            assert!(map_drm_format(drm as u32).unwrap() == vulkan);
+        }
+        assert!(map_drm_format(DrmFourcc::Bgrx8888 as u32).is_err());
     }
 }
