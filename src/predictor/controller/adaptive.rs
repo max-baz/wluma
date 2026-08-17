@@ -1,6 +1,6 @@
 use smol::channel::{Receiver, Sender};
 
-use super::{distance, Cooldown, INITIAL_TIMEOUT, PENDING_COOLDOWN};
+use super::{distance, monotonic, Cooldown, INITIAL_TIMEOUT, PENDING_COOLDOWN};
 use crate::{
     als::{Reading, Scale},
     channel_ext::ReceiverExt,
@@ -28,7 +28,7 @@ fn collapse_luma(entries: &[Entry]) -> Vec<Entry> {
         .collect()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LumaDirection {
     Increasing,
     Decreasing,
@@ -50,6 +50,7 @@ pub struct Controller {
     scale: Scale,
     als_direction: AlsDirection,
     luma_direction: LumaDirection,
+    model: Option<monotonic::Model>,
     kind: Kind,
 }
 
@@ -104,6 +105,7 @@ impl Controller {
             scale,
             als_direction: AlsDirection::Increasing,
             luma_direction: LumaDirection::Decreasing,
+            model: None,
             kind,
         }
     }
@@ -115,16 +117,19 @@ impl Controller {
 
     pub fn without_luma(mut self) -> Self {
         self.luma_aware = false;
+        self.model = None;
         self
     }
 
     pub fn with_als_direction(mut self, als_direction: AlsDirection) -> Self {
         self.als_direction = als_direction;
+        self.model = None;
         self
     }
 
     pub fn with_luma_direction(mut self, luma_direction: LumaDirection) -> Self {
         self.luma_direction = luma_direction;
+        self.model = None;
         self
     }
 
@@ -274,32 +279,16 @@ impl Controller {
         let pending_luma = self.luma(pending.luma);
         let scale = self.scale;
         self.data.entries.retain(|entry| {
-            let entry_luma = if luma_aware { entry.luma } else { 0 };
             let nearby = if luma_aware {
                 distance(scale, pending.als, pending_luma, entry)
             } else {
                 (scale.coordinate(pending.als) - scale.coordinate(entry.als)).abs()
             } <= REPLACEMENT_DISTANCE;
-            let pending_should_be_higher = match self.als_direction {
-                AlsDirection::Increasing => entry.als <= pending.als,
-                AlsDirection::Decreasing => entry.als >= pending.als,
-            } && match self.luma_direction {
-                LumaDirection::Increasing => entry_luma <= pending_luma,
-                LumaDirection::Decreasing => entry_luma >= pending_luma,
-            };
-            let pending_should_be_lower = match self.als_direction {
-                AlsDirection::Increasing => entry.als >= pending.als,
-                AlsDirection::Decreasing => entry.als <= pending.als,
-            } && match self.luma_direction {
-                LumaDirection::Increasing => entry_luma >= pending_luma,
-                LumaDirection::Decreasing => entry_luma <= pending_luma,
-            };
-            let conflict = (pending_should_be_higher && entry.brightness > pending.brightness)
-                || (pending_should_be_lower && entry.brightness < pending.brightness);
-            !nearby && !conflict
+            !nearby
         });
 
         self.data.entries.push(pending);
+        self.model = None;
 
         self.data
             .entries
@@ -320,9 +309,22 @@ impl Controller {
 
     async fn predict(&mut self, als: u64, luma: u8) {
         let luma = self.luma(luma);
-        let projected = (!self.luma_aware).then(|| collapse_luma(&self.data.entries));
-        let entries = projected.as_deref().unwrap_or(&self.data.entries);
-        if let Some(prediction) = super::interpolate(entries, self.scale, als, luma) {
+        if self.model.is_none() {
+            let projected = (!self.luma_aware).then(|| collapse_luma(&self.data.entries));
+            let entries = projected.as_deref().unwrap_or(&self.data.entries);
+            self.model = monotonic::Model::fit(
+                entries,
+                self.scale,
+                self.als_direction,
+                self.luma_direction,
+                self.luma_aware,
+            );
+        }
+        if let Some(prediction) = self
+            .model
+            .as_ref()
+            .map(|model| model.predict(als, luma).round() as u64)
+        {
             log::trace!(
                 "[{}] Prediction: {}={prediction}{} (als: {als}, luma: {luma})",
                 self.output_name,
@@ -548,25 +550,13 @@ mod tests {
         Ok(())
     }
 
-    // If user configured brightness value in certain conditions (amount of light around, screen contents),
-    // how changes in environment or screen contents can affect the desired brightness level:
-    //
-    // |                 | darker env      | same env         | brighter env     |
-    // | darker screen   | any             | same or brighter | same or brighter |
-    // | same screen     | same or dimmer  | only same        | same or brighter |
-    // | brighter screen | same or dimmer  | same or dimmer   | any              |
-
     #[apply(test!)]
-    async fn test_learn_data_cleanup() -> Result<()> {
+    async fn learning_replaces_only_observations_of_the_same_conditions() -> Result<()> {
         let (mut controller, _, _) = setup().await?;
         controller.data.entries = vec![
-            Entry::new(21, 20, 30),
+            Entry::new(21, 20, 31),
             Entry::new(10, 30, 31),
             Entry::new(30, 10, 29),
-            Entry::new(10, 30, 29),
-            Entry::new(30, 10, 31),
-            Entry::new(10, 10, 30),
-            Entry::new(30, 30, 30),
         ];
         controller.pending = Some(Entry::new(ALS_DIM, 20, 30));
 
@@ -574,69 +564,9 @@ mod tests {
 
         assert_eq!(
             vec![
-                Entry::new(10, 10, 30),
-                Entry::new(10, 30, 29),
+                Entry::new(10, 30, 31),
                 Entry::new(20, 20, 30),
-                Entry::new(30, 10, 31),
-                Entry::new(30, 30, 30),
-            ],
-            controller.data.entries
-        );
-        Ok(())
-    }
-
-    #[apply(test!)]
-    async fn test_learn_cleanup_when_brightness_decreases_as_als_increases() -> Result<()> {
-        let (controller, _, _) = setup().await?;
-        let mut controller = controller.with_als_direction(AlsDirection::Decreasing);
-        controller.data.entries = vec![
-            Entry::new(ALS_DARK, 20, 31),
-            Entry::new(ALS_DARK, 20, 29),
-            Entry::new(ALS_BRIGHT, 20, 29),
-            Entry::new(ALS_BRIGHT, 20, 31),
-        ];
-        controller.pending = Some(Entry::new(ALS_DIM, 20, 30));
-
-        controller.learn();
-
-        assert_eq!(
-            vec![
-                Entry::new(ALS_DARK, 20, 31),
-                Entry::new(ALS_DIM, 20, 30),
-                Entry::new(ALS_BRIGHT, 20, 29),
-            ],
-            controller.data.entries
-        );
-        Ok(())
-    }
-
-    #[apply(test!)]
-    async fn dim_cleanup_increases_with_luma_and_decreases_with_als() -> Result<()> {
-        let (controller, _, _) = setup().await?;
-        let mut controller = controller
-            .with_als_direction(AlsDirection::Decreasing)
-            .with_luma_direction(LumaDirection::Increasing);
-        controller.data.entries = vec![
-            Entry::new(ALS_DARK, 20, 31),
-            Entry::new(ALS_DARK, 20, 29),
-            Entry::new(ALS_BRIGHT, 20, 29),
-            Entry::new(ALS_BRIGHT, 20, 31),
-            Entry::new(ALS_DIM, 10, 29),
-            Entry::new(ALS_DIM, 10, 31),
-            Entry::new(ALS_DIM, 30, 31),
-            Entry::new(ALS_DIM, 30, 29),
-        ];
-        controller.pending = Some(Entry::new(ALS_DIM, 20, 30));
-
-        controller.learn();
-
-        assert_eq!(
-            vec![
-                Entry::new(ALS_DARK, 20, 31),
-                Entry::new(ALS_DIM, 10, 29),
-                Entry::new(ALS_DIM, 20, 30),
-                Entry::new(ALS_DIM, 30, 31),
-                Entry::new(ALS_BRIGHT, 20, 29),
+                Entry::new(30, 10, 29),
             ],
             controller.data.entries
         );
@@ -657,73 +587,33 @@ mod tests {
     }
 
     #[apply(test!)]
-    async fn test_predict_rejects_distant_data() -> Result<()> {
+    async fn one_observation_is_used_across_the_domain() -> Result<()> {
         let (mut controller, _, prediction_rx) = setup().await?;
-        controller.data.entries = vec![Entry::new(100, 100, 100)];
+        controller.data.entries = vec![Entry::new(100, 100, 42)];
 
-        // predict() should not be called with no nearby data, but just in case confirm we don't panic
         controller.predict(ALS_DIM, 20).await;
 
-        assert!(prediction_rx.try_recv().is_err());
-
+        assert_eq!(42, prediction_rx.try_recv()?);
         Ok(())
     }
 
     #[apply(test!)]
-    async fn test_predict_one_data_point() -> Result<()> {
+    async fn reported_non_monotonic_case_is_monotonic() -> Result<()> {
         let (mut controller, _, prediction_rx) = setup().await?;
-        controller.data.entries = vec![Entry::new(ALS_DIM, 10, 15)];
-
-        controller.predict(ALS_DIM, 20).await;
-
-        assert_eq!(15, prediction_rx.try_recv()?);
-        Ok(())
-    }
-
-    #[apply(test!)]
-    async fn test_predict_known_conditions() -> Result<()> {
-        let (mut controller, _, prediction_rx) = setup().await?;
-        controller.data.entries = vec![Entry::new(ALS_DIM, 10, 15), Entry::new(ALS_DIM, 20, 30)];
-
-        controller.predict(ALS_DIM, 20).await;
-
-        assert_eq!(30, prediction_rx.try_recv()?);
-        Ok(())
-    }
-
-    #[apply(test!)]
-    async fn test_predict_approximate() -> Result<()> {
-        let (mut controller, _, prediction_rx) = setup().await?;
+        controller.scale = Scale::Lux;
         controller.data.entries = vec![
-            Entry::new(ALS_DIM, 10, 15),
-            Entry::new(ALS_DIM, 20, 30),
-            Entry::new(ALS_DIM, 100, 100),
+            Entry::new(0, 14, 10),
+            Entry::new(1, 61, 10),
+            Entry::new(503, 0, 100),
+            Entry::new(1264, 18, 100),
         ];
 
-        // Approximated using weighted distance to all known points:
-        // dist1 = sqrt((x1 - x2)^2 + (y1 - y2)^2)
-        // weight1 = (1/dist1^2) / (1/dist1^2 + 1/dist2^2 + 1/dist3^2)
-        // prediction = weight1*brightness1 + weight2*brightness2 + weight3*brightness
-        controller.predict(ALS_DIM, 50).await;
+        controller.predict(0, 20).await;
+        controller.predict(0, 47).await;
+        let darker = prediction_rx.try_recv()?;
+        let whiter = prediction_rx.try_recv()?;
 
-        assert_eq!(39, prediction_rx.try_recv()?);
-        Ok(())
-    }
-
-    #[apply(test!)]
-    async fn test_predict_uses_local_continuous_data() -> Result<()> {
-        let (mut controller, _, prediction_rx) = setup().await?;
-        controller.data.entries = vec![
-            Entry::new(ALS_DIM, 10, 15),
-            Entry::new(ALS_DIM, 20, 30),
-            Entry::new(ALS_DIM, 100, 100),
-            Entry::new(ALS_DARK, 50, 100),
-            Entry::new(ALS_BRIGHT, 51, 100),
-        ];
-
-        controller.predict(ALS_DIM, 50).await;
-
-        assert_eq!(94, prediction_rx.try_recv()?);
+        assert!(whiter <= darker, "{whiter} > {darker}");
         Ok(())
     }
 }

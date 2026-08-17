@@ -115,7 +115,7 @@ To explicitly disable ambient-light input, use:
 [als.none]
 ```
 
-The adaptive predictor stores numeric ALS readings and continuously interpolates between nearby learned conditions. IIO lux is mapped to a logarithmic coordinate, while webcam and synthetic time values are linear.
+The adaptive predictor remembers your adjustments and applies them across the full range of ambient light and screen content, including conditions you have not encountered before. It reproduces learned preferences when possible and balances conflicting preferences instead of discarding them.
 
 ### Idle dimming
 

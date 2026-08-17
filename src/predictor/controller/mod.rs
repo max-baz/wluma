@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 pub mod adaptive;
 pub mod manual;
+mod monotonic;
 
 const INITIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const PENDING_COOLDOWN: Duration = Duration::from_millis(1500);
@@ -177,10 +178,6 @@ fn interpolate_raw(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Optio
     Some(prediction)
 }
 
-fn interpolate(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<u64> {
-    interpolate_raw(entries, scale, als, luma).map(|prediction| prediction.round() as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +190,9 @@ mod tests {
             Entry::new(747, 0, 0),
         ];
 
-        assert_eq!(interpolate(&entries, Scale::Lux, 5, 0), Some(2));
+        assert_eq!(
+            interpolate_raw(&entries, Scale::Lux, 5, 0).map(f64::round),
+            Some(2.0)
+        );
     }
 }
