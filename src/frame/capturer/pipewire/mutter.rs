@@ -22,7 +22,7 @@ pub(super) fn node(output_name: &str) -> Result<u32> {
     let session = connection.with_proxy(DESTINATION, session_path, TIMEOUT);
     let mut properties = HashMap::<String, Variant<Box<dyn RefArg>>>::new();
     properties.insert("cursor-mode".to_string(), Variant(Box::new(0_u32)));
-    properties.insert("is-recording".to_string(), Variant(Box::new(false)));
+    properties.insert("is-recording".to_string(), Variant(Box::new(true)));
     let (stream_path,): (dbus::Path<'static>,) = session.method_call(
         SESSION_INTERFACE,
         "RecordMonitor",
