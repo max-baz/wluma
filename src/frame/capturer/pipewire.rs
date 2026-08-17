@@ -10,7 +10,7 @@ use pw::spa::pod::Pod;
 use std::cell::RefCell;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,15 @@ mod mutter;
 mod portal;
 
 pub(super) type Portal = (dbus::arg::OwnedFd, dbus::blocking::Connection);
-pub(super) type Source = (u32, Option<Portal>);
+
+pub(super) struct Source {
+    node: u32,
+    portal: Option<Portal>,
+    // Compositor-owned nodes only live as long as the protocol session that
+    // created them. Keep that session alive while PipeWire consumes the node.
+    _kwin_session: Option<kwin::Session>,
+    _mutter_connection: Option<dbus::blocking::Connection>,
+}
 
 pub(super) struct Prepared {
     source: Source,
@@ -29,47 +37,39 @@ pub(super) struct Prepared {
 const FRAME_RATE: u32 = 10;
 const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / FRAME_RATE as u64);
 
-pub fn run(
-    output_name: &str,
-    protocol: PipewireProtocol,
-    controller: Controller,
-    vulkan_device: Option<&str>,
-    active: Arc<AtomicBool>,
-    status: crate::control::Hub,
-) {
-    match prepare(output_name, protocol) {
-        Ok(prepared) => {
-            let (_, result) = run_prepared(
-                prepared,
-                controller,
-                vulkan_device,
-                active,
-                &status,
-                output_name,
-            );
-            if let Err(error) = result {
-                status.set_capturer(output_name, "failed");
-                log::error!("Unable to capture PipeWire screen stream: {error:#}");
-            }
-        }
-        Err(error) => {
-            status.set_capturer(output_name, "failed");
-            log::error!("Unable to create PipeWire screen stream: {error:#}");
-        }
-    }
+pub(super) fn portal_can_restore(output_name: &str) -> bool {
+    portal::can_restore(output_name)
 }
 
-pub(super) fn prepare(output_name: &str, protocol: PipewireProtocol) -> Result<Prepared> {
+pub(super) fn prepare(
+    output_name: &str,
+    protocol: PipewireProtocol,
+    deadline: Instant,
+    active: &AtomicBool,
+) -> Result<Prepared> {
     let source = match protocol {
-        PipewireProtocol::Any => return automatic_source(output_name),
-        PipewireProtocol::Portal => portal_source(output_name),
-        PipewireProtocol::Kwin => kwin::node(output_name).and_then(|(node, _)| {
-            node.map(|node| (node, None))
-                .ok_or_else(|| anyhow!("KWin PipeWire screencast protocol is not available"))
-        }),
-        PipewireProtocol::Mutter => kwin::connector(output_name)
-            .and_then(|connector| mutter::node(&connector))
-            .map(|node| (node, None)),
+        PipewireProtocol::Any => return automatic_source(output_name, deadline, active),
+        PipewireProtocol::Portal => portal_source(output_name, deadline, active),
+        PipewireProtocol::Kwin => {
+            kwin::node(output_name, deadline, active).and_then(|(source, _)| {
+                source
+                    .map(|(node, session)| Source {
+                        node,
+                        portal: None,
+                        _kwin_session: Some(session),
+                        _mutter_connection: None,
+                    })
+                    .ok_or_else(|| anyhow!("KWin PipeWire screencast protocol is not available"))
+            })
+        }
+        PipewireProtocol::Mutter => kwin::connector(output_name, deadline, active)
+            .and_then(|connector| mutter::node(&connector, deadline, active))
+            .map(|(node, connection)| Source {
+                node,
+                portal: None,
+                _kwin_session: None,
+                _mutter_connection: Some(connection),
+            }),
     }?;
     Ok(Prepared { source, protocol })
 }
@@ -81,15 +81,18 @@ pub(super) fn run_prepared(
     active: Arc<AtomicBool>,
     status: &crate::control::Hub,
     output_name: &str,
-) -> (Controller, Result<()>) {
+    startup: super::Startup,
+) -> (Controller, usize, Result<()>) {
     let Prepared { source, protocol } = prepared;
     let controller = Rc::new(RefCell::new(controller));
+    let successful_frames = Arc::new(AtomicUsize::new(0));
     let result = capture(
-        source.0,
-        source.1,
+        source,
         Rc::clone(&controller),
+        successful_frames.clone(),
         vulkan_device,
         active,
+        startup,
         || {
             status.set_capturer(
                 output_name,
@@ -102,14 +105,23 @@ pub(super) fn run_prepared(
     let controller = Rc::into_inner(controller)
         .expect("PipeWire capture retained the predictor controller")
         .into_inner();
-    (controller, result)
+    (
+        controller,
+        successful_frames.load(Ordering::Relaxed),
+        result,
+    )
 }
 
-fn automatic_source(output_name: &str) -> Result<Prepared> {
-    let connector = match kwin::node(output_name) {
-        Ok((Some(node), _)) => {
+fn automatic_source(output_name: &str, deadline: Instant, active: &AtomicBool) -> Result<Prepared> {
+    let connector = match kwin::node(output_name, deadline, active) {
+        Ok((Some((node, session)), _)) => {
             return Ok(Prepared {
-                source: (node, None),
+                source: Source {
+                    node,
+                    portal: None,
+                    _kwin_session: Some(session),
+                    _mutter_connection: None,
+                },
                 protocol: PipewireProtocol::Kwin,
             })
         }
@@ -119,14 +131,23 @@ fn automatic_source(output_name: &str) -> Result<Prepared> {
             None
         }
     };
-    match mutter::node(connector.as_deref().unwrap_or(output_name)) {
-        Ok(node) => Ok(Prepared {
-            source: (node, None),
+    match mutter::node(
+        connector.as_deref().unwrap_or(output_name),
+        deadline,
+        active,
+    ) {
+        Ok((node, connection)) => Ok(Prepared {
+            source: Source {
+                node,
+                portal: None,
+                _kwin_session: None,
+                _mutter_connection: Some(connection),
+            },
             protocol: PipewireProtocol::Mutter,
         }),
         Err(error) => {
             log::debug!("Mutter PipeWire capture is unavailable: {error:#}");
-            portal_source(output_name).map(|source| Prepared {
+            portal_source(output_name, deadline, active).map(|source| Prepared {
                 source,
                 protocol: PipewireProtocol::Portal,
             })
@@ -134,9 +155,14 @@ fn automatic_source(output_name: &str) -> Result<Prepared> {
     }
 }
 
-fn portal_source(output_name: &str) -> Result<(u32, Option<Portal>)> {
-    let source = portal::source(output_name)?;
-    Ok((source.node, Some((source.remote, source.connection))))
+fn portal_source(output_name: &str, deadline: Instant, active: &AtomicBool) -> Result<Source> {
+    let source = portal::source(output_name, deadline, active)?;
+    Ok(Source {
+        node: source.node,
+        portal: Some((source.remote, source.connection)),
+        _kwin_session: None,
+        _mutter_connection: None,
+    })
 }
 
 struct Data {
@@ -144,22 +170,34 @@ struct Data {
     format: spa::param::video::VideoInfoRaw,
     vulkan: Vulkan,
     last_frame_at: Option<Instant>,
+    discard_stale_inputs_before_first_frame: bool,
 }
 
 fn capture(
-    node: u32,
-    portal: Option<Portal>,
+    source: Source,
     controller: Rc<RefCell<Controller>>,
+    successful_frames: Arc<AtomicUsize>,
     vulkan_device: Option<&str>,
     active: Arc<AtomicBool>,
+    startup: super::Startup,
     on_ready: impl FnOnce(),
 ) -> Result<()> {
+    let Source {
+        node,
+        portal,
+        _kwin_session,
+        _mutter_connection,
+    } = source;
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let timer_loop = mainloop.clone();
     let shutdown_active = active.clone();
+    let validation_frames = successful_frames.clone();
     let shutdown_timer = mainloop.loop_().add_timer(move |_| {
-        if !shutdown_active.load(Ordering::Relaxed) {
+        let validation_timed_out = validation_frames.load(Ordering::Relaxed)
+            < startup.required_frames
+            && Instant::now() >= startup.deadline;
+        if !shutdown_active.load(Ordering::Relaxed) || validation_timed_out {
             timer_loop.quit();
         }
     });
@@ -199,8 +237,10 @@ fn capture(
         format: Default::default(),
         vulkan,
         last_frame_at: None,
+        discard_stale_inputs_before_first_frame: startup.discard_stale_inputs_before_first_frame,
     };
     let stream_loop = mainloop.clone();
+    let processed_frames = successful_frames.clone();
     let _listener = stream
         .add_local_listener_with_user_data(data)
         .state_changed(move |_, _, old, new| match new {
@@ -232,7 +272,7 @@ fn capture(
                 }
             }
         })
-        .process(|stream, state| {
+        .process(move |stream, state| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -287,7 +327,13 @@ fn capture(
                 .vulkan
                 .luma_percent_from_external_fd(&object)
                 .expect("Unable to process PipeWire DMA-BUF with Vulkan");
-            smol::block_on(state.controller.borrow_mut().adjust(luma));
+            let mut controller = state.controller.borrow_mut();
+            if state.discard_stale_inputs_before_first_frame {
+                controller.discard_stale_inputs();
+                state.discard_stale_inputs_before_first_frame = false;
+            }
+            smol::block_on(controller.adjust(luma));
+            processed_frames.fetch_add(1, Ordering::Relaxed);
         })
         .register()?;
 
@@ -371,7 +417,15 @@ fn capture(
     )?;
     on_ready();
     mainloop.run();
-    if active.load(Ordering::Relaxed) {
+    if active.load(Ordering::Relaxed)
+        && successful_frames.load(Ordering::Relaxed) < startup.required_frames
+    {
+        Err(anyhow!(
+            "PipeWire screen capture produced only {} of {} required startup frames",
+            successful_frames.load(Ordering::Relaxed),
+            startup.required_frames,
+        ))
+    } else if active.load(Ordering::Relaxed) {
         Err(anyhow!("PipeWire screen stream stopped unexpectedly"))
     } else {
         Ok(())

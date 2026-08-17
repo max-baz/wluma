@@ -7,12 +7,14 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::Connection;
 use wayland_client::Dispatch;
+use wayland_client::EventQueue;
 use wayland_client::Proxy;
 use wayland_client::QueueHandle;
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1;
@@ -46,6 +48,8 @@ pub struct Capturer {
     pending_frame: Option<Object>,
     dmabuf_formats: Vec<(u32, Vec<u64>)>,
     failure: Option<anyhow::Error>,
+    successful_frames: usize,
+    discard_stale_inputs_before_first_frame: bool,
     controller: Option<Controller>,
     // linux-dmabuf-v1
     dmabuf: Option<ZwpLinuxDmabufV1>,
@@ -97,6 +101,8 @@ impl Capturer {
             pending_frame: None,
             dmabuf_formats: Vec::new(),
             failure: None,
+            successful_frames: 0,
+            discard_stale_inputs_before_first_frame: false,
             controller: None,
             // linux-dmabuf-v1
             dmabuf: None,
@@ -116,7 +122,11 @@ impl Capturer {
 }
 
 impl Capturer {
-    pub fn supported_protocols() -> Result<Vec<WaylandProtocol>> {
+    pub fn protocol(&self) -> &WaylandProtocol {
+        &self.protocol
+    }
+
+    pub fn supported_protocols(deadline: Instant) -> Result<Vec<WaylandProtocol>> {
         let mut capturer = Self::new(WaylandProtocol::Any);
         let connection = Connection::connect_to_env().context("Unable to connect to Wayland")?;
         let display = connection.display();
@@ -129,8 +139,7 @@ impl Capturer {
                 desired_output: String::new(),
             },
         );
-        event_queue
-            .roundtrip(&mut capturer)
+        timed_roundtrip(&connection, &mut event_queue, &mut capturer, deadline)
             .context("Unable to query Wayland protocols")?;
         let mut protocols = Vec::new();
         if capturer.img_copy_capture_manager.is_some()
@@ -148,17 +157,22 @@ impl Capturer {
         Ok(protocols)
     }
 
-    pub fn run(
+    pub(super) fn run(
         &mut self,
         output_name: &str,
         controller: Controller,
         vulkan_device: Option<&str>,
         active: Arc<AtomicBool>,
         status: &crate::control::Hub,
-    ) -> (Controller, Result<()>) {
+        startup: super::Startup,
+    ) -> (Controller, usize, Result<()>) {
         self.controller = Some(controller);
-        let result = self.run_inner(output_name, vulkan_device, active, status);
-        (self.controller.take().unwrap(), result)
+        let result = self.run_inner(output_name, vulkan_device, active, status, startup);
+        (
+            self.controller.take().unwrap(),
+            self.successful_frames,
+            result,
+        )
     }
 
     fn run_inner(
@@ -167,8 +181,11 @@ impl Capturer {
         vulkan_device: Option<&str>,
         active: Arc<AtomicBool>,
         status: &crate::control::Hub,
+        startup: super::Startup,
     ) -> Result<()> {
         self.vulkan_device = vulkan_device.map(str::to_string);
+        self.discard_stale_inputs_before_first_frame =
+            startup.discard_stale_inputs_before_first_frame;
         let connection =
             Connection::connect_to_env().context("Unable to connect to Wayland display")?;
         let display = connection.display();
@@ -183,13 +200,11 @@ impl Capturer {
         display.get_registry(&qh, ctx);
 
         // 1. process registry events
-        event_queue
-            .roundtrip(self)
+        timed_roundtrip(&connection, &mut event_queue, self, startup.deadline)
             .context("Unable to perform initial Wayland roundtrip")?;
 
         // 2. registry requested wl_output events, process those
-        event_queue
-            .roundtrip(self)
+        timed_roundtrip(&connection, &mut event_queue, self, startup.deadline)
             .context("Unable to perform second initial Wayland roundtrip")?;
 
         if self.output.is_none() {
@@ -258,6 +273,7 @@ impl Capturer {
                 }
             }
         };
+        self.protocol = protocol_to_use.clone();
         log::debug!("Using {protocol_to_use} protocol to request frames");
 
         self.vulkan = Some(
@@ -278,6 +294,15 @@ impl Capturer {
         );
 
         while active.load(Ordering::Relaxed) {
+            if self.successful_frames < startup.required_frames
+                && Instant::now() >= startup.deadline
+            {
+                return Err(anyhow!(
+                    "Wayland screen capture produced only {} of {} required startup frames",
+                    self.successful_frames,
+                    startup.required_frames,
+                ));
+            }
             if !self.is_processing_frame {
                 if let Some(output) = self.output.as_ref() {
                     match protocol_to_use {
@@ -371,6 +396,77 @@ impl Capturer {
         }
 
         Ok(())
+    }
+
+    fn process_luma(&mut self, luma: u8) {
+        let controller = self.controller.as_mut().unwrap();
+        if self.discard_stale_inputs_before_first_frame {
+            controller.discard_stale_inputs();
+            self.discard_stale_inputs_before_first_frame = false;
+        }
+        // TODO: replace with await
+        smol::block_on(controller.adjust(luma));
+        self.successful_frames += 1;
+    }
+}
+
+fn timed_roundtrip<State>(
+    connection: &Connection,
+    event_queue: &mut EventQueue<State>,
+    state: &mut State,
+    deadline: Instant,
+) -> Result<()>
+where
+    State: Dispatch<WlCallback, Arc<AtomicBool>> + 'static,
+{
+    let done = Arc::new(AtomicBool::new(false));
+    connection
+        .display()
+        .sync(&event_queue.handle(), done.clone());
+
+    while !done.load(Ordering::Relaxed) {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("Timed out waiting for the Wayland compositor"));
+        }
+        event_queue.dispatch_pending(state)?;
+        connection.flush()?;
+        let Some(guard) = event_queue.prepare_read() else {
+            continue;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = remaining.min(Duration::from_millis(200));
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let mut fd = libc::pollfd {
+            fd: connection.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+        if ready > 0 {
+            guard.read()?;
+        } else {
+            drop(guard);
+            if ready < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
+    event_queue.dispatch_pending(state)?;
+    Ok(())
+}
+
+impl Dispatch<WlCallback, Arc<AtomicBool>> for Capturer {
+    fn event(
+        _state: &mut Self,
+        _callback: &WlCallback,
+        event: <WlCallback as Proxy>::Event,
+        done: &Arc<AtomicBool>,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_callback::Event::Done { .. } = event {
+            done.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -617,8 +713,7 @@ impl Dispatch<ZwlrExportDmabufFrameV1, ()> for Capturer {
                     }
                 };
 
-                // TODO: replace with await
-                smol::block_on(state.controller.as_mut().unwrap().adjust(luma));
+                state.process_luma(luma);
 
                 frame.destroy();
 
@@ -838,8 +933,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for Capturer {
                     }
                 };
 
-                // TODO: replace with await
-                smol::block_on(state.controller.as_mut().unwrap().adjust(luma));
+                state.process_luma(luma);
 
                 frame.destroy();
 
@@ -1079,8 +1173,7 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for Capturer {
                     }
                 };
 
-                // TODO: replace with await
-                smol::block_on(state.controller.as_mut().unwrap().adjust(luma));
+                state.process_luma(luma);
 
                 frame.destroy();
 

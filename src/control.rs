@@ -189,6 +189,14 @@ impl Hub {
         });
     }
 
+    pub fn clear_luma(&self, name: &str) {
+        self.change(|state| {
+            if let Some(screen) = state.screens.get_mut(name) {
+                screen.luma = None;
+            }
+        });
+    }
+
     pub fn set_brightness(&self, name: &str, brightness: u8) {
         self.change(|state| {
             if let Some(monitor) = state.monitors.get_mut(name) {

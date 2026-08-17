@@ -6,7 +6,7 @@ use dbus::message::MatchRule;
 use dbus::Path;
 use std::collections::HashMap;
 use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -24,12 +24,30 @@ pub(super) struct Source {
     pub connection: Connection,
 }
 
-pub(super) fn source(output_name: &str) -> Result<Source> {
+pub(super) fn source(
+    output_name: &str,
+    deadline: std::time::Instant,
+    active: &AtomicBool,
+) -> Result<Source> {
     // Portal dialogs do not identify the requested output. Keep requests serialized so the
-    // message below unambiguously identifies which monitor the user should select.
-    let _interaction = PORTAL_INTERACTION
-        .lock()
-        .map_err(|_| anyhow!("ScreenCast portal interaction lock was poisoned"))?;
+    // message below unambiguously identifies which monitor the user should select. Waiting for
+    // another output's dialog must not consume this output's interaction timeout.
+    let interaction_timeout = deadline.saturating_duration_since(std::time::Instant::now());
+    let _interaction = loop {
+        match PORTAL_INTERACTION.try_lock() {
+            Ok(interaction) => break interaction,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(anyhow!("ScreenCast portal interaction lock was poisoned"));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if !active.load(Ordering::Relaxed) {
+                    return Err(anyhow!("ScreenCast portal request was interrupted"));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    let deadline = std::time::Instant::now() + interaction_timeout;
 
     let connection = Connection::new_session()?;
     let proxy = connection.with_proxy(DESTINATION, PATH, TIMEOUT);
@@ -39,7 +57,7 @@ pub(super) fn source(output_name: &str) -> Result<Source> {
         "session_handle_token".to_string(),
         Variant(Box::new(token("session"))),
     );
-    let result = request(&connection, create_options, |options| {
+    let result = request(&connection, create_options, deadline, active, |options| {
         proxy.method_call(INTERFACE, "CreateSession", (options,))
     })?;
     let session_path = prop_cast::<String>(&result, "session_handle")
@@ -62,12 +80,12 @@ pub(super) fn source(output_name: &str) -> Result<Source> {
             Err(error) => log::warn!("Unable to load PipeWire portal restore token: {error:#}"),
         }
     }
-    request(&connection, select_options, |options| {
+    request(&connection, select_options, deadline, active, |options| {
         proxy.method_call(INTERFACE, "SelectSources", (session_path.clone(), options))
     })?;
 
     log::info!("Select the monitor for output '{output_name}' in the screen sharing dialog");
-    let result = request(&connection, options(), |options| {
+    let result = request(&connection, options(), deadline, active, |options| {
         proxy.method_call(INTERFACE, "Start", (session_path.clone(), "", options))
     })?;
     if version >= 4 {
@@ -99,7 +117,13 @@ pub(super) fn source(output_name: &str) -> Result<Source> {
     })
 }
 
-fn request<F>(connection: &Connection, mut options: PropMap, call: F) -> Result<PropMap>
+fn request<F>(
+    connection: &Connection,
+    mut options: PropMap,
+    deadline: std::time::Instant,
+    active: &AtomicBool,
+    call: F,
+) -> Result<PropMap>
 where
     F: FnOnce(PropMap) -> Result<(Path<'static>,), dbus::Error>,
 {
@@ -122,6 +146,15 @@ where
         true
     })?;
 
+    if !active.load(Ordering::Relaxed) {
+        connection.remove_match(match_token)?;
+        return Err(anyhow!("ScreenCast portal request was interrupted"));
+    }
+    if std::time::Instant::now() >= deadline {
+        connection.remove_match(match_token)?;
+        return Err(anyhow!("Timed out waiting for the ScreenCast portal"));
+    }
+
     let (returned_path,) = match call(options) {
         Ok(result) => result,
         Err(error) => {
@@ -140,7 +173,16 @@ where
         if let Some(result) = response.lock().unwrap().take() {
             break result;
         }
-        connection.process(Duration::from_secs(1))?;
+        if !active.load(Ordering::Relaxed) {
+            connection.remove_match(match_token)?;
+            return Err(anyhow!("ScreenCast portal request was interrupted"));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            connection.remove_match(match_token)?;
+            return Err(anyhow!("Timed out waiting for the ScreenCast portal"));
+        }
+        connection.process(remaining.min(Duration::from_secs(1)))?;
     };
     connection.remove_match(match_token)?;
     match status {
@@ -152,6 +194,10 @@ where
 
 fn options() -> PropMap {
     HashMap::<String, Variant<Box<dyn RefArg>>>::new()
+}
+
+pub(super) fn can_restore(output_name: &str) -> bool {
+    restore_token(output_name).ok().flatten().is_some()
 }
 
 fn restore_token(output_name: &str) -> Result<Option<String>> {

@@ -1,9 +1,14 @@
 use super::super::wayland::{match_action, output_match, MatchAction, OutputMatch};
 use anyhow::{anyhow, Context, Result};
+use std::os::fd::{AsFd, AsRawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_registry::WlRegistry;
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::ZxdgOutputV1;
 use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::ZkdeScreencastStreamUnstableV1;
@@ -36,16 +41,41 @@ struct State {
     failure: Option<String>,
 }
 
-pub(super) fn node(output_name: &str) -> Result<(Option<u32>, Option<String>)> {
-    find(output_name, true)
+pub(super) struct Session {
+    active: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
 
-pub(super) fn connector(output_name: &str) -> Result<String> {
-    let (_, connector) = find(output_name, false)?;
+type Found = (Option<(u32, Session)>, Option<String>);
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub(super) fn node(output_name: &str, deadline: Instant, active: &AtomicBool) -> Result<Found> {
+    find(output_name, true, deadline, active)
+}
+
+pub(super) fn connector(
+    output_name: &str,
+    deadline: Instant,
+    active: &AtomicBool,
+) -> Result<String> {
+    let (_, connector) = find(output_name, false, deadline, active)?;
     connector.ok_or_else(|| anyhow!("Unable to determine the connector for '{output_name}'"))
 }
 
-fn find(output_name: &str, create_stream: bool) -> Result<(Option<u32>, Option<String>)> {
+fn find(
+    output_name: &str,
+    create_stream: bool,
+    deadline: Instant,
+    active: &AtomicBool,
+) -> Result<Found> {
     let connection = Connection::connect_to_env().context("Unable to connect to Wayland")?;
     let display = connection.display();
     let mut queue = connection.new_event_queue();
@@ -59,7 +89,7 @@ fn find(output_name: &str, create_stream: bool) -> Result<(Option<u32>, Option<S
     );
 
     let mut state = State::default();
-    queue.roundtrip(&mut state)?;
+    timed_roundtrip(&connection, &mut queue, &mut state, deadline, active)?;
     if let Some(manager) = state.xdg_output_manager.as_ref() {
         for (output, output_context, needs_xdg_output) in &state.outputs {
             if *needs_xdg_output {
@@ -74,7 +104,7 @@ fn find(output_name: &str, create_stream: bool) -> Result<(Option<u32>, Option<S
             }
         }
     }
-    queue.roundtrip(&mut state)?;
+    timed_roundtrip(&connection, &mut queue, &mut state, deadline, active)?;
 
     let output = state
         .output
@@ -90,18 +120,124 @@ fn find(output_name: &str, create_stream: bool) -> Result<(Option<u32>, Option<S
         return Ok((None, state.output_name));
     };
     manager.stream_output(output, Pointer::Hidden.into(), &qh, ());
+    connection.flush()?;
 
     while state.node.is_none() && state.failure.is_none() {
-        queue.blocking_dispatch(&mut state)?;
+        dispatch_until_readable(&connection, &mut queue, &mut state, deadline, active)?;
     }
     if let Some(error) = state.failure.take() {
         return Err(anyhow!(error));
     }
 
     let node = state.node.unwrap();
-    std::thread::spawn(move || while queue.blocking_dispatch(&mut state).is_ok() {});
+    let active = Arc::new(AtomicBool::new(true));
+    let thread_active = active.clone();
+    let thread = std::thread::spawn(move || {
+        while thread_active.load(Ordering::Relaxed) {
+            if queue.dispatch_pending(&mut state).is_err() || connection.flush().is_err() {
+                break;
+            }
+            let Some(guard) = queue.prepare_read() else {
+                continue;
+            };
+            let mut fd = libc::pollfd {
+                fd: connection.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut fd, 1, 200) };
+            if ready > 0 {
+                if guard.read().is_err() {
+                    break;
+                }
+            } else {
+                drop(guard);
+                if ready < 0 {
+                    break;
+                }
+            }
+        }
+    });
     log::debug!("Using KWin PipeWire stream node {node}");
-    Ok((Some(node), None))
+    Ok((
+        Some((
+            node,
+            Session {
+                active,
+                thread: Some(thread),
+            },
+        )),
+        None,
+    ))
+}
+
+fn timed_roundtrip(
+    connection: &Connection,
+    queue: &mut EventQueue<State>,
+    state: &mut State,
+    deadline: Instant,
+    active: &AtomicBool,
+) -> Result<()> {
+    let done = Arc::new(AtomicBool::new(false));
+    connection.display().sync(&queue.handle(), done.clone());
+    while !done.load(Ordering::Relaxed) {
+        dispatch_until_readable(connection, queue, state, deadline, active)?;
+    }
+    queue.dispatch_pending(state)?;
+    Ok(())
+}
+
+fn dispatch_until_readable(
+    connection: &Connection,
+    queue: &mut EventQueue<State>,
+    state: &mut State,
+    deadline: Instant,
+    active: &AtomicBool,
+) -> Result<()> {
+    if !active.load(Ordering::Relaxed) {
+        return Err(anyhow!("KWin screen capture setup was interrupted"));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(anyhow!("Timed out waiting for KWin screen capture setup"));
+    }
+    queue.dispatch_pending(state)?;
+    connection.flush()?;
+    let Some(guard) = queue.prepare_read() else {
+        return Ok(());
+    };
+    let timeout = remaining.min(Duration::from_millis(200));
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut fd = libc::pollfd {
+        fd: connection.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+    if ready > 0 {
+        guard.read()?;
+    } else {
+        drop(guard);
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+impl Dispatch<WlCallback, Arc<AtomicBool>> for State {
+    fn event(
+        _state: &mut Self,
+        _callback: &WlCallback,
+        event: <WlCallback as Proxy>::Event,
+        done: &Arc<AtomicBool>,
+        _connection: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_callback::Event::Done { .. } = event {
+            done.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, OutputContext> for State {

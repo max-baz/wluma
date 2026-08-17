@@ -155,6 +155,22 @@ impl Controller {
         self.pending_cooldown.clear();
     }
 
+    pub fn discard_stale_inputs(&mut self) {
+        // Without a current frame, queued brightness changes cannot be associated
+        // with the luma at which they happened. Preserve startup inputs until the
+        // controller has initialized, but discard stale learning state afterwards.
+        if self.last_als.is_none() {
+            return;
+        }
+        while let Ok(als) = self.als_rx.try_recv() {
+            self.last_als = Some(als);
+        }
+        while self.user_rx.try_recv().is_ok() {}
+        self.initial_brightness = None;
+        self.pending = None;
+        self.pending_cooldown.clear();
+    }
+
     pub async fn adjust(&mut self, luma: u8) {
         if self.last_als.is_none() {
             // ALS controller is expected to send the initial value on this channel asap
@@ -365,6 +381,20 @@ mod tests {
         assert!(controller.data.entries.is_empty());
         assert!(controller.pending.is_none());
         assert!(prediction_rx.is_empty());
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn discards_brightness_changes_that_cannot_be_matched_to_a_frame() -> Result<()> {
+        let (mut controller, user_tx, _) = setup().await?;
+        controller.adjust(20).await;
+        assert!(controller.pending.is_some());
+
+        user_tx.send(100).await?;
+        controller.discard_stale_inputs();
+
+        assert!(controller.pending.is_none());
+        assert!(controller.user_rx.is_empty());
         Ok(())
     }
 

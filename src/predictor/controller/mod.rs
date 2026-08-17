@@ -135,6 +135,15 @@ impl Controller {
             controller.discard_inputs().await;
         }
     }
+
+    pub(crate) fn discard_stale_inputs(&mut self) {
+        if let Inner::Adaptive(controller) = &mut self.inner {
+            controller.discard_stale_inputs();
+        }
+        for controller in &mut self.additional {
+            controller.discard_stale_inputs();
+        }
+    }
 }
 
 fn distance(scale: Scale, als: u64, luma: u8, entry: &Entry) -> f64 {
