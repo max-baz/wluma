@@ -9,9 +9,9 @@ const PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 const INTERFACE: &str = "org.gnome.Mutter.DisplayConfig";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-type Crtc = (u32, u64, i32, i32, i32, i32, i32, u32, Vec<u32>, PropMap);
-type Output = (u32, u64, i32, Vec<u32>, String, Vec<u32>, Vec<u32>, PropMap);
-type Mode = (u32, u64, u32, u32, f64, u32);
+type Crtc = (u32, i64, i32, i32, i32, i32, i32, u32, Vec<u32>, PropMap);
+type Output = (u32, i64, i32, Vec<u32>, String, Vec<u32>, Vec<u32>, PropMap);
+type Mode = (u32, i64, u32, u32, f64, u32);
 type Resources = (u32, Vec<Crtc>, Vec<Output>, Vec<Mode>, i32, i32);
 
 pub struct Backend {
@@ -95,7 +95,8 @@ fn find_output<'a>(outputs: &'a [Output], output_name: &str) -> Result<&'a Outpu
 
 #[cfg(test)]
 mod tests {
-    use super::{find_output, Output};
+    use super::{find_output, Crtc, Mode, Output};
+    use dbus::arg::Arg;
 
     fn output(name: &str) -> Output {
         (
@@ -108,6 +109,13 @@ mod tests {
             vec![],
             Default::default(),
         )
+    }
+
+    #[test]
+    fn resource_types_match_mutter_dbus_signatures() {
+        assert_eq!(Crtc::signature().to_string(), "(uxiiiiiuaua{sv})");
+        assert_eq!(Output::signature().to_string(), "(uxiausauaua{sv})");
+        assert_eq!(Mode::signature().to_string(), "(uxuudu)");
     }
 
     #[test]
