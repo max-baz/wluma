@@ -109,7 +109,7 @@ pub(super) fn source(
     let (remote,): (OwnedFd,) =
         proxy.method_call(INTERFACE, "OpenPipeWireRemote", (session_path, empty))?;
 
-    log::debug!("Using portal PipeWire stream node {node}");
+    log::info!("Using portal PipeWire stream node {node}");
     Ok(Source {
         node,
         remote,
@@ -194,10 +194,6 @@ where
 
 fn options() -> PropMap {
     HashMap::<String, Variant<Box<dyn RefArg>>>::new()
-}
-
-pub(super) fn can_restore(output_name: &str) -> bool {
-    restore_token(output_name).ok().flatten().is_some()
 }
 
 fn restore_token(output_name: &str) -> Result<Option<String>> {

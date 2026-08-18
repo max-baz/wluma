@@ -2,6 +2,7 @@ use async_signal::{Signal, Signals};
 use futures_util::StreamExt;
 use macro_rules_attribute::apply;
 use smol::channel;
+use std::process::ExitCode;
 
 mod als;
 mod brightness;
@@ -21,23 +22,23 @@ mod state;
 pub const VERSION: &str = env!("WLUMA_VERSION");
 
 #[apply(smol_macros::main!)]
-async fn main() {
+async fn main() -> ExitCode {
     match cli::parse() {
         Ok(cli::Mode::Daemon) => {}
         Ok(cli::Mode::Command { request, stream }) => {
             if let Err(error) = control::send(&request, stream).await {
                 eprintln!("wluma: {error:#}");
-                std::process::exit(1);
+                return ExitCode::FAILURE;
             }
-            return;
+            return ExitCode::SUCCESS;
         }
         Ok(cli::Mode::Print(value)) => {
             println!("{value}");
-            return;
+            return ExitCode::SUCCESS;
         }
         Err(error) => {
             eprintln!("wluma: {error}");
-            std::process::exit(2);
+            return ExitCode::from(2);
         }
     }
 
@@ -174,10 +175,11 @@ async fn main() {
     );
     let mut signals = Signals::new([Signal::Int, Signal::Quit, Signal::Term])
         .expect("Unable to listen for shutdown signals");
-    smol::future::race(runtime.run(), async {
+    let result = smol::future::race(runtime.run(), async {
         if let Some(signal) = signals.next().await {
             log::debug!("Received shutdown signal: {signal:?}");
         }
+        Ok(())
     })
     .await;
     runtime.stop().await;
@@ -185,4 +187,12 @@ async fn main() {
     drop(als_task);
     drop(idle_task);
     drop(webcam_task);
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            log::error!("{error:#}");
+            ExitCode::FAILURE
+        }
+    }
 }

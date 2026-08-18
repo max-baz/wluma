@@ -69,7 +69,7 @@ pub(super) fn node(
         connection.process(remaining.min(Duration::from_millis(200)))?;
     };
 
-    log::debug!("Using GNOME Mutter PipeWire stream node {node}");
+    log::info!("Using GNOME Mutter PipeWire stream node {node}");
     // Mutter owns the stream only for the lifetime of this D-Bus client. Return the
     // connection with the node so reconnects can cleanly drop the old session.
     Ok((node, connection))

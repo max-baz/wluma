@@ -31,15 +31,11 @@ pub(super) struct Source {
 
 pub(super) struct Prepared {
     source: Source,
-    pub protocol: PipewireProtocol,
+    protocol: PipewireProtocol,
 }
 
 const FRAME_RATE: u32 = 10;
 const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / FRAME_RATE as u64);
-
-pub(super) fn portal_can_restore(output_name: &str) -> bool {
-    portal::can_restore(output_name)
-}
 
 pub(super) fn prepare(
     output_name: &str,
@@ -48,7 +44,11 @@ pub(super) fn prepare(
     active: &AtomicBool,
 ) -> Result<Prepared> {
     let source = match protocol {
-        PipewireProtocol::Any => return automatic_source(output_name, deadline, active),
+        PipewireProtocol::Any => {
+            return Err(anyhow!(
+                "automatic PipeWire protocol must be resolved before preparation"
+            ))
+        }
         PipewireProtocol::Portal => portal_source(output_name, deadline, active),
         PipewireProtocol::Kwin => {
             kwin::node(output_name, deadline, active).and_then(|(source, _)| {
@@ -110,49 +110,6 @@ pub(super) fn run_prepared(
         successful_frames.load(Ordering::Relaxed),
         result,
     )
-}
-
-fn automatic_source(output_name: &str, deadline: Instant, active: &AtomicBool) -> Result<Prepared> {
-    let connector = match kwin::node(output_name, deadline, active) {
-        Ok((Some((node, session)), _)) => {
-            return Ok(Prepared {
-                source: Source {
-                    node,
-                    portal: None,
-                    _kwin_session: Some(session),
-                    _mutter_connection: None,
-                },
-                protocol: PipewireProtocol::Kwin,
-            })
-        }
-        Ok((None, connector)) => connector,
-        Err(error) => {
-            log::debug!("KWin PipeWire capture is unavailable: {error:#}");
-            None
-        }
-    };
-    match mutter::node(
-        connector.as_deref().unwrap_or(output_name),
-        deadline,
-        active,
-    ) {
-        Ok((node, connection)) => Ok(Prepared {
-            source: Source {
-                node,
-                portal: None,
-                _kwin_session: None,
-                _mutter_connection: Some(connection),
-            },
-            protocol: PipewireProtocol::Mutter,
-        }),
-        Err(error) => {
-            log::debug!("Mutter PipeWire capture is unavailable: {error:#}");
-            portal_source(output_name, deadline, active).map(|source| Prepared {
-                source,
-                protocol: PipewireProtocol::Portal,
-            })
-        }
-    }
 }
 
 fn portal_source(output_name: &str, deadline: Instant, active: &AtomicBool) -> Result<Source> {

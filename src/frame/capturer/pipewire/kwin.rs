@@ -158,7 +158,7 @@ fn find(
             }
         }
     });
-    log::debug!("Using KWin PipeWire stream node {node}");
+    log::info!("Using KWin PipeWire stream node {node}");
     Ok((
         Some((
             node,

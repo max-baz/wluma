@@ -29,6 +29,8 @@ pub struct Runtime {
     idle: Option<config::Idle>,
     idle_events: Option<Receiver<idle::Event>>,
     idle_brightness: Option<u8>,
+    fatal_errors: Receiver<String>,
+    fatal_error_tx: Sender<String>,
 }
 
 struct Session {
@@ -54,6 +56,7 @@ impl Runtime {
         let (idle, idle_events) = idle.map_or((None, None), |(config, events)| {
             (Some(config), Some(events))
         });
+        let (fatal_error_tx, fatal_errors) = channel::unbounded();
         Self {
             configured,
             als_scale,
@@ -70,13 +73,16 @@ impl Runtime {
             idle,
             idle_events,
             idle_brightness: None,
+            fatal_errors,
+            fatal_error_tx,
         }
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self) -> Result<()> {
         enum Event {
             Command(Result<crate::control::Command, smol::channel::RecvError>),
             Idle(Result<idle::Event, smol::channel::RecvError>),
+            Fatal(String),
             Tick,
         }
 
@@ -89,20 +95,31 @@ impl Runtime {
                         smol::Timer::after(TOPOLOGY_POLL_INTERVAL).await;
                         Event::Tick
                     },
-                    async {
-                        match &self.idle_events {
-                            Some(events) => Event::Idle(events.recv().await),
-                            None => std::future::pending().await,
-                        }
-                    },
+                    smol::future::race(
+                        async {
+                            match &self.idle_events {
+                                Some(events) => Event::Idle(events.recv().await),
+                                None => std::future::pending().await,
+                            }
+                        },
+                        async {
+                            Event::Fatal(
+                                self.fatal_errors
+                                    .recv()
+                                    .await
+                                    .expect("runtime retains the fatal error sender"),
+                            )
+                        },
+                    ),
                 ),
             )
             .await;
             match event {
                 Event::Command(Ok(command)) => self.command(command).await,
-                Event::Command(Err(_)) => return,
+                Event::Command(Err(_)) => return Ok(()),
                 Event::Idle(Ok(event)) => self.idle_event(event).await,
                 Event::Idle(Err(_)) => self.idle_events = None,
+                Event::Fatal(error) => anyhow::bail!(error),
                 Event::Tick => self.step().await,
             }
         }
@@ -421,6 +438,7 @@ impl Runtime {
                 &self.legacy_thresholds,
                 &self.registrations,
                 self.status.clone(),
+                self.fatal_error_tx.clone(),
             )
             .await
             {
@@ -455,6 +473,7 @@ impl Session {
         legacy_thresholds: &HashMap<u64, String>,
         registrations: &Sender<Sender<als::Reading>>,
         status: crate::control::Hub,
+        fatal_errors: Sender<String>,
     ) -> Result<Self> {
         let (als_tx, als_rx) = channel::bounded(1);
         let (user_tx, user_rx) = channel::bounded(128);
@@ -635,9 +654,10 @@ impl Session {
         };
         let active = Arc::new(AtomicBool::new(true));
         let capture_active = active.clone();
+        let fatal_active = active.clone();
         let capture_status = status.clone();
         let capturer = smol::spawn(async move {
-            frame_capturer
+            if let Err(error) = frame_capturer
                 .run(
                     &name,
                     controller,
@@ -645,7 +665,13 @@ impl Session {
                     capture_active,
                     capture_status,
                 )
-                .await;
+                .await
+            {
+                let _ = fatal_errors.send(format!("{error:#}")).await;
+                while fatal_active.load(Ordering::Relaxed) {
+                    smol::Timer::after(Duration::from_millis(100)).await;
+                }
+            }
         });
 
         Ok(Self {

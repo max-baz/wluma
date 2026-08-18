@@ -4,7 +4,7 @@ A tool for Wayland compositors to automatically adjust screen brightness based o
 
 ## Supported screen capture protocols
 
-With the default `capturer = "auto"`, `wluma` tries supported Wayland protocols followed by PipeWire sources. If none works during selection, it uses ambient light only and periodically retries. Once a protocol produces usable frames, `wluma` keeps using that protocol and reconnects it after interruptions. See the "Configuration" section below for details.
+With the default `capturer = "auto"`, `wluma` tries supported Wayland protocols followed by PipeWire sources once during startup. If none works, it uses ambient light only for the rest of the process lifetime. Once a protocol produces usable frames, `wluma` keeps using and reconnecting only that protocol after interruptions. See the "Configuration" section below for details.
 
 The list of supported protocols:
 
@@ -168,7 +168,7 @@ For `output.ddcutil`, if the identifier that works for brightness control is not
 
 _Tip:_ run `wluma` with `RUST_LOG=debug` to see how your outputs are being identified, so that you can choose an appropriate `name` and `identifier` configuration values.
 
-The `capturer` field will determine how screen contents will be captured. Currently supported values are `auto`, `wayland`, `pipewire` and `none` (ignores screen contents and predicts brightness only based on ALS). The default value `auto` tries supported Wayland protocols first, then PipeWire sources. If none works during selection, `wluma` uses ALS alone and periodically retries. Once a protocol successfully produces frames, it remains selected and is reconnected after interruptions; brightness prediction pauses until capture recovers rather than switching protocols or assuming zero screen luma. The value `wayland` chooses among Wayland protocols in the same way, but you can force a specific one with `ext-image-copy-capture-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1`. The value `pipewire` similarly chooses among PipeWire sources, and you can force a specific source with `zkde-screencast-unstable-v1`, `gnome-mutter-screencast` or `xdg-desktop-portal-screencast`.
+The `capturer` field will determine how screen contents will be captured. Currently supported values are `auto`, `wayland`, `pipewire` and `none` (ignores screen contents and predicts brightness only based on ALS). The default value `auto` tries supported Wayland protocols first, then PipeWire sources, once during startup. If none works, `wluma` uses ALS alone for the rest of the process lifetime. Once a protocol successfully produces frames, it remains selected and only that protocol is reconnected after interruptions; brightness prediction pauses until capture recovers rather than switching protocols or assuming zero screen luma. The value `wayland` chooses among Wayland protocols in the same way, but you can force a specific one with `ext-image-copy-capture-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1`. The value `pipewire` similarly chooses among PipeWire sources, and you can force a specific source with `zkde-screencast-unstable-v1`, `gnome-mutter-screencast` or `xdg-desktop-portal-screencast`. Unlike `auto`, an explicitly selected family or protocol exits with an error if no capture protocol becomes available during startup.
 
 _Tip:_ run `wluma` with `RUST_LOG=debug` and `capturer="auto"` to see which protocols are supported and which capturer `wluma` chooses.
 

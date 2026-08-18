@@ -274,7 +274,7 @@ impl Capturer {
             }
         };
         self.protocol = protocol_to_use.clone();
-        log::debug!("Using {protocol_to_use} protocol to request frames");
+        log::info!("Using {protocol_to_use} protocol to request frames");
 
         self.vulkan = Some(
             if let Some(path) = self.vulkan_device.as_deref() {

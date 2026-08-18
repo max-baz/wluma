@@ -2,7 +2,7 @@ pub mod none;
 pub mod pipewire;
 pub mod wayland;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,7 +12,6 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PORTAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const PROBATION_FRAMES: usize = 3;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
-const DEGRADED_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[allow(clippy::large_enum_variant)]
 pub enum Capturer {
@@ -57,9 +56,14 @@ struct RunPolicy {
     discard_stale_inputs_before_first_frame: bool,
 }
 
+#[derive(Clone, Copy)]
+enum SelectedMode {
+    Explicit,
+    Reconnecting,
+}
+
 struct Attempt {
     controller: crate::predictor::Controller,
-    candidate: Candidate,
     frames: usize,
     result: Result<()>,
 }
@@ -67,9 +71,7 @@ struct Attempt {
 impl Candidate {
     fn startup_timeout(&self) -> Duration {
         match self {
-            Self::Pipewire(
-                crate::config::PipewireProtocol::Portal | crate::config::PipewireProtocol::Any,
-            ) => PORTAL_STARTUP_TIMEOUT,
+            Self::Pipewire(crate::config::PipewireProtocol::Portal) => PORTAL_STARTUP_TIMEOUT,
             _ => STARTUP_TIMEOUT,
         }
     }
@@ -88,40 +90,28 @@ impl Candidate {
             required_frames: policy.required_frames,
             discard_stale_inputs_before_first_frame: policy.discard_stale_inputs_before_first_frame,
         };
-        let (controller, candidate, frames, result) = match self {
+        let (controller, frames, result) = match self {
             Self::Wayland(protocol) => {
                 let mut capturer = wayland::Capturer::new(protocol.clone());
-                let (controller, frames, result) =
-                    capturer.run(output, controller, vulkan_device, active, status, startup);
-                (
-                    controller,
-                    Self::Wayland(capturer.protocol().clone()),
-                    frames,
-                    result,
-                )
+                capturer.run(output, controller, vulkan_device, active, status, startup)
             }
             Self::Pipewire(protocol) => {
                 match pipewire::prepare(output, protocol.clone(), startup.deadline, &active) {
-                    Ok(prepared) => {
-                        let candidate = Self::Pipewire(prepared.protocol.clone());
-                        let (controller, frames, result) = pipewire::run_prepared(
-                            prepared,
-                            controller,
-                            vulkan_device,
-                            active,
-                            status,
-                            output,
-                            startup,
-                        );
-                        (controller, candidate, frames, result)
-                    }
-                    Err(error) => (controller, self.clone(), 0, Err(error)),
+                    Ok(prepared) => pipewire::run_prepared(
+                        prepared,
+                        controller,
+                        vulkan_device,
+                        active,
+                        status,
+                        output,
+                        startup,
+                    ),
+                    Err(error) => (controller, 0, Err(error)),
                 }
             }
         };
         Attempt {
             controller,
-            candidate,
             frames,
             result,
         }
@@ -136,7 +126,7 @@ impl Capturer {
         vulkan_device: Option<&str>,
         active: Arc<AtomicBool>,
         status: crate::control::Hub,
-    ) {
+    ) -> Result<()> {
         match self {
             Capturer::Auto => {
                 run_selecting(
@@ -147,11 +137,13 @@ impl Capturer {
                     active,
                     status,
                 )
-                .await;
+                .await
             }
             Capturer::None(mut capturer) => {
+                log::info!("Screen capture is disabled for '{output_name}'");
                 status.set_capturer(output_name, "none");
-                capturer.run(output_name, controller, active).await
+                capturer.run(output_name, controller, active).await;
+                Ok(())
             }
             Capturer::Pipewire(crate::config::PipewireProtocol::Any) => {
                 run_selecting(
@@ -162,7 +154,7 @@ impl Capturer {
                     active,
                     status,
                 )
-                .await;
+                .await
             }
             Capturer::Wayland(capturer)
                 if capturer.protocol() == &crate::config::WaylandProtocol::Any =>
@@ -175,7 +167,7 @@ impl Capturer {
                     active,
                     status,
                 )
-                .await;
+                .await
             }
             Capturer::Pipewire(protocol) => {
                 run_explicit(
@@ -186,7 +178,7 @@ impl Capturer {
                     active,
                     status,
                 )
-                .await;
+                .await
             }
             Capturer::Wayland(capturer) => {
                 run_explicit(
@@ -197,7 +189,7 @@ impl Capturer {
                     active,
                     status,
                 )
-                .await;
+                .await
             }
         }
     }
@@ -210,7 +202,7 @@ async fn run_explicit(
     vulkan_device: Option<&str>,
     active: Arc<AtomicBool>,
     status: crate::control::Hub,
-) {
+) -> Result<()> {
     let output = output_name.to_string();
     let vulkan_device = vulkan_device.map(str::to_string);
     smol::unblock(move || {
@@ -221,10 +213,10 @@ async fn run_explicit(
             vulkan_device.as_deref(),
             active,
             &status,
-            false,
-        );
+            SelectedMode::Explicit,
+        )
     })
-    .await;
+    .await
 }
 
 async fn run_selecting(
@@ -234,7 +226,7 @@ async fn run_selecting(
     vulkan_device: Option<&str>,
     active: Arc<AtomicBool>,
     status: crate::control::Hub,
-) {
+) -> Result<()> {
     let output = output_name.to_string();
     let vulkan_device = vulkan_device.map(str::to_string);
     smol::unblock(move || {
@@ -245,9 +237,9 @@ async fn run_selecting(
             vulkan_device.as_deref(),
             active,
             &status,
-        );
+        )
     })
-    .await;
+    .await
 }
 
 fn select_and_run(
@@ -257,78 +249,79 @@ fn select_and_run(
     vulkan_device: Option<&str>,
     active: Arc<AtomicBool>,
     status: &crate::control::Hub,
-) {
-    let mut initial_probe = true;
-    while active.load(Ordering::Relaxed) {
-        let candidates = candidates(family, output, initial_probe);
-        initial_probe = false;
-
-        for candidate in candidates {
-            log::debug!("Capturer selection trying {candidate} for '{output}'");
-            let attempt = candidate.run(
-                output,
-                controller,
-                vulkan_device,
-                active.clone(),
-                status,
-                RunPolicy {
-                    required_frames: PROBATION_FRAMES,
-                    discard_stale_inputs_before_first_frame: false,
-                },
-            );
-            controller = attempt.controller;
-            match attempt.result {
-                Ok(()) => return,
-                Err(error) if probe_is_established(attempt.frames) => {
-                    controller.discard_stale_inputs();
-                    log::warn!(
-                        "Established {} screen capture failed for '{output}': {error:#}",
-                        attempt.candidate
-                    );
-                    run_selected(
-                        attempt.candidate,
-                        output,
-                        controller,
-                        vulkan_device,
-                        active.clone(),
-                        status,
-                        true,
-                    );
-                    return;
-                }
-                Err(error) => {
-                    controller.discard_stale_inputs();
-                    status.set_capturer(output, "initializing");
-                    status.clear_luma(output);
-                    log::warn!(
-                        "{candidate} screen capture did not become ready for '{output}': {error:#}"
-                    );
-                }
-            }
+) -> Result<()> {
+    for candidate in candidates(family) {
+        if !active.load(Ordering::Relaxed) {
+            return Ok(());
         }
-
-        status.set_capturer(output, "none");
-        status.clear_luma(output);
-        log::warn!(
-            "No screen capturer is currently available for '{output}', using ALS only and retrying"
+        log::debug!("Capturer selection trying {candidate} for '{output}'");
+        let attempt = candidate.run(
+            output,
+            controller,
+            vulkan_device,
+            active.clone(),
+            status,
+            RunPolicy {
+                required_frames: PROBATION_FRAMES,
+                discard_stale_inputs_before_first_frame: false,
+            },
         );
-        let retry_at = Instant::now() + DEGRADED_RETRY_INTERVAL;
-        while active.load(Ordering::Relaxed) && Instant::now() < retry_at {
-            smol::block_on(controller.adjust(0));
-            if !wait_while_active(&active, Duration::from_millis(200)) {
-                return;
+        controller = attempt.controller;
+        match attempt.result {
+            Ok(()) => return Ok(()),
+            Err(error) if probe_is_established(attempt.frames) => {
+                controller.discard_stale_inputs();
+                log::warn!(
+                    "Established {candidate} screen capture failed for '{output}': {error:#}"
+                );
+                return run_selected(
+                    candidate,
+                    output,
+                    controller,
+                    vulkan_device,
+                    active,
+                    status,
+                    SelectedMode::Reconnecting,
+                );
+            }
+            Err(error) => {
+                controller.discard_stale_inputs();
+                status.set_capturer(output, "initializing");
+                status.clear_luma(output);
+                log::debug!(
+                    "{candidate} screen capture did not become ready for '{output}': {error:#}"
+                );
             }
         }
-        status.set_capturer(output, "initializing");
-        status.clear_luma(output);
     }
+
+    if !active.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if !allows_degraded_mode(family) {
+        let configured = match family {
+            CandidateFamily::Wayland => "wayland",
+            CandidateFamily::Pipewire => "pipewire",
+            CandidateFamily::Any => unreachable!("auto capture permits degraded mode"),
+        };
+        anyhow::bail!(
+            "Explicitly configured capturer=\"{configured}\" did not find any available protocol for '{output}'"
+        );
+    }
+
+    status.set_capturer(output, "none");
+    status.clear_luma(output);
+    log::warn!("No screen capturer is available for '{output}', using ALS only");
+    while active.load(Ordering::Relaxed) {
+        smol::block_on(controller.adjust(0));
+        if !wait_while_active(&active, Duration::from_millis(200)) {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
-fn candidates(
-    family: CandidateFamily,
-    output: &str,
-    include_interactive_portal: bool,
-) -> Vec<Candidate> {
+fn candidates(family: CandidateFamily) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     if matches!(family, CandidateFamily::Any | CandidateFamily::Wayland) {
         match wayland::Capturer::supported_protocols(Instant::now() + STARTUP_TIMEOUT) {
@@ -339,38 +332,39 @@ fn candidates(
         }
     }
     if matches!(family, CandidateFamily::Any | CandidateFamily::Pipewire) {
-        candidates.extend(pipewire_candidates(
-            include_interactive_portal || pipewire::portal_can_restore(output),
-        ));
+        candidates.extend(pipewire_candidates());
     }
     candidates
 }
 
-fn pipewire_candidates(include_portal: bool) -> Vec<Candidate> {
-    let mut candidates = vec![
+fn pipewire_candidates() -> Vec<Candidate> {
+    vec![
         Candidate::Pipewire(crate::config::PipewireProtocol::Kwin),
         Candidate::Pipewire(crate::config::PipewireProtocol::Mutter),
-    ];
-    if include_portal {
-        candidates.push(Candidate::Pipewire(crate::config::PipewireProtocol::Portal));
-    }
-    candidates
+        Candidate::Pipewire(crate::config::PipewireProtocol::Portal),
+    ]
 }
 
 fn probe_is_established(frames: usize) -> bool {
     frames >= PROBATION_FRAMES
 }
 
+fn allows_degraded_mode(family: CandidateFamily) -> bool {
+    matches!(family, CandidateFamily::Any)
+}
+
 /// Runs a chosen candidate until shutdown, reconnecting only that protocol.
 fn run_selected(
-    mut candidate: Candidate,
+    candidate: Candidate,
     output: &str,
     mut controller: crate::predictor::Controller,
     vulkan_device: Option<&str>,
     active: Arc<AtomicBool>,
     status: &crate::control::Hub,
-    mut reconnecting: bool,
-) {
+    mode: SelectedMode,
+) -> Result<()> {
+    let startup_failure_is_fatal = matches!(mode, SelectedMode::Explicit);
+    let mut reconnecting = matches!(mode, SelectedMode::Reconnecting);
     while active.load(Ordering::Relaxed) {
         let attempt = candidate.run(
             output,
@@ -384,12 +378,20 @@ fn run_selected(
             },
         );
         controller = attempt.controller;
-        if attempt.frames > 0 {
-            candidate = attempt.candidate;
-        }
         match attempt.result {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(error) => {
+                if startup_failure_is_fatal
+                    && !reconnecting
+                    && attempt.frames == 0
+                    && active.load(Ordering::Relaxed)
+                {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Explicitly configured {candidate} screen capture failed for '{output}'"
+                        )
+                    });
+                }
                 reconnecting = true;
                 controller.discard_stale_inputs();
                 log::warn!(
@@ -401,9 +403,10 @@ fn run_selected(
         status.set_capturer(output, "reconnecting");
         status.clear_luma(output);
         if !wait_while_active(&active, RECONNECT_INTERVAL) {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 fn wait_while_active(active: &AtomicBool, duration: Duration) -> bool {
@@ -428,16 +431,16 @@ mod tests {
     }
 
     #[test]
-    fn pipewire_candidates_keep_portal_last_and_optional() {
+    fn only_auto_capture_allows_degraded_mode() {
+        assert!(allows_degraded_mode(CandidateFamily::Any));
+        assert!(!allows_degraded_mode(CandidateFamily::Wayland));
+        assert!(!allows_degraded_mode(CandidateFamily::Pipewire));
+    }
+
+    #[test]
+    fn pipewire_candidates_keep_portal_last() {
         assert_eq!(
-            pipewire_candidates(false),
-            vec![
-                Candidate::Pipewire(crate::config::PipewireProtocol::Kwin),
-                Candidate::Pipewire(crate::config::PipewireProtocol::Mutter),
-            ]
-        );
-        assert_eq!(
-            pipewire_candidates(true).last(),
+            pipewire_candidates().last(),
             Some(&Candidate::Pipewire(
                 crate::config::PipewireProtocol::Portal
             ))
