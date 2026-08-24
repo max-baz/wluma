@@ -32,7 +32,7 @@ use wayland_protocols_wlr::export_dmabuf::v1::client::zwlr_export_dmabuf_manager
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
-const DELAY_SUCCESS: Duration = Duration::from_millis(100);
+const DELAY_SUCCESS: Duration = super::CAPTURE_INTERVAL;
 const DELAY_FAILURE: Duration = Duration::from_millis(1000);
 
 pub struct Capturer {
@@ -49,6 +49,8 @@ pub struct Capturer {
     dmabuf_formats: Vec<(u32, Vec<u64>)>,
     failure: Option<anyhow::Error>,
     successful_frames: usize,
+    latest_luma: Option<u8>,
+    last_adjustment: Option<Instant>,
     discard_stale_inputs_before_first_frame: bool,
     controller: Option<Controller>,
     // linux-dmabuf-v1
@@ -102,6 +104,8 @@ impl Capturer {
             dmabuf_formats: Vec::new(),
             failure: None,
             successful_frames: 0,
+            latest_luma: None,
+            last_adjustment: None,
             discard_stale_inputs_before_first_frame: false,
             controller: None,
             // linux-dmabuf-v1
@@ -343,7 +347,7 @@ impl Capturer {
                                 );
                                 frame.capture();
 
-                                self.is_processing_frame = true;
+                                self.frame_requested();
                             }
                         }
                         WaylandProtocol::WlrScreencopyUnstableV1 => {
@@ -353,7 +357,7 @@ impl Capturer {
                                 &event_queue.handle(),
                                 (),
                             );
-                            self.is_processing_frame = true;
+                            self.frame_requested();
                         }
                         WaylandProtocol::WlrExportDmabufUnstableV1 => {
                             self.dmabuf_manager.as_ref().unwrap().capture_output(
@@ -362,7 +366,7 @@ impl Capturer {
                                 &event_queue.handle(),
                                 (),
                             );
-                            self.is_processing_frame = true;
+                            self.frame_requested();
                         }
                         WaylandProtocol::Any => unreachable!(),
                     }
@@ -375,6 +379,7 @@ impl Capturer {
             if let Some(error) = self.failure.take() {
                 return Err(error);
             }
+            self.process_prediction_tick();
             connection
                 .flush()
                 .context("Error flushing Wayland requests")?;
@@ -398,15 +403,33 @@ impl Capturer {
         Ok(())
     }
 
+    fn frame_requested(&mut self) {
+        self.is_processing_frame = true;
+    }
+
     fn process_luma(&mut self, luma: u8) {
-        let controller = self.controller.as_mut().unwrap();
         if self.discard_stale_inputs_before_first_frame {
-            controller.discard_stale_inputs();
+            self.controller.as_mut().unwrap().discard_stale_inputs();
             self.discard_stale_inputs_before_first_frame = false;
         }
-        // TODO: replace with await
-        smol::block_on(controller.adjust(luma));
+        self.latest_luma = Some(luma);
         self.successful_frames += 1;
+        self.adjust_prediction(luma, Instant::now());
+    }
+
+    fn process_prediction_tick(&mut self) {
+        let now = Instant::now();
+        if super::prediction_due(self.last_adjustment, now) {
+            if let Some(luma) = self.latest_luma {
+                self.adjust_prediction(luma, now);
+            }
+        }
+    }
+
+    fn adjust_prediction(&mut self, luma: u8, now: Instant) {
+        self.last_adjustment = Some(now);
+        // TODO: replace with await
+        smol::block_on(self.controller.as_mut().unwrap().adjust(luma));
     }
 }
 
@@ -1197,6 +1220,21 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for Capturer {
 #[cfg(test)]
 mod tests {
     use super::{match_action, output_match, parse_drm_device, MatchAction, OutputMatch};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn prediction_runs_at_fixed_interval() {
+        let now = Instant::now();
+        assert!(super::super::prediction_due(None, now));
+        assert!(!super::super::prediction_due(
+            Some(now),
+            now + super::super::PREDICTION_INTERVAL - Duration::from_nanos(1)
+        ));
+        assert!(super::super::prediction_due(
+            Some(now),
+            now + super::super::PREDICTION_INTERVAL
+        ));
+    }
 
     #[test]
     fn parses_drm_device() {

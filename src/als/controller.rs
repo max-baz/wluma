@@ -171,11 +171,7 @@ impl Controller {
                         value,
                         stable: false,
                     };
-                    self.last_reading = Some(reading);
-                    self.value_txs.retain(|channel| !channel.is_closed());
-                    for channel in &self.value_txs {
-                        let _ = channel.try_send(reading);
-                    }
+                    self.publish(reading);
                 }
                 let now = Instant::now();
                 let interval = self
@@ -185,11 +181,7 @@ impl Controller {
                         now.duration_since(previous)
                     });
                 if let Some(reading) = self.stabilizer.observe(value, interval, now) {
-                    self.last_reading = Some(reading);
-                    self.value_txs.retain(|channel| !channel.is_closed());
-                    for channel in &self.value_txs {
-                        let _ = channel.try_send(reading);
-                    }
+                    self.publish(reading);
                 }
             }
             Ok(None) => {}
@@ -198,6 +190,14 @@ impl Controller {
 
         if let Some(remaining) = self.als.poll_interval().checked_sub(started.elapsed()) {
             Timer::after(remaining).await;
+        }
+    }
+
+    fn publish(&mut self, reading: Reading) {
+        self.last_reading = Some(reading);
+        self.value_txs.retain(|channel| !channel.is_closed());
+        for channel in &self.value_txs {
+            let _ = channel.force_send(reading);
         }
     }
 
@@ -274,6 +274,24 @@ mod tests {
             }),
             stabilizer.observe(10, Duration::ZERO, start + Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn pending_reading_is_replaced_with_the_latest() {
+        let (_, registration_rx) = smol::channel::unbounded();
+        let mut controller = Controller::new(Als::None(Default::default()), registration_rx);
+        let (value_tx, value_rx) = smol::channel::bounded(1);
+        controller.value_txs.push(value_tx);
+        controller.publish(Reading {
+            value: 1,
+            stable: true,
+        });
+        let latest = Reading {
+            value: 2,
+            stable: false,
+        };
+        controller.publish(latest);
+        assert_eq!(value_rx.try_recv().unwrap(), latest);
     }
 
     #[test]

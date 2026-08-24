@@ -7,7 +7,7 @@ use drm_fourcc::DrmFourcc;
 use pipewire as pw;
 use pw::spa;
 use pw::spa::pod::Pod;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -35,7 +35,6 @@ pub(super) struct Prepared {
 }
 
 const FRAME_RATE: u32 = 10;
-const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / FRAME_RATE as u64);
 
 pub(super) fn prepare(
     output_name: &str,
@@ -124,6 +123,8 @@ fn portal_source(output_name: &str, deadline: Instant, active: &AtomicBool) -> R
 
 struct Data {
     controller: Rc<RefCell<Controller>>,
+    latest_luma: Rc<Cell<Option<u8>>>,
+    last_adjustment: Rc<Cell<Option<Instant>>>,
     format: spa::param::video::VideoInfoRaw,
     vulkan: Vulkan,
     last_frame_at: Option<Instant>,
@@ -162,6 +163,21 @@ fn capture(
         Some(Duration::from_millis(100)),
         Some(Duration::from_millis(100)),
     );
+    let latest_luma = Rc::new(Cell::new(None));
+    let last_adjustment = Rc::new(Cell::new(None));
+    let prediction_controller = Rc::clone(&controller);
+    let prediction_luma = Rc::clone(&latest_luma);
+    let prediction_last_adjustment = Rc::clone(&last_adjustment);
+    let prediction_timer = mainloop.loop_().add_timer(move |_| {
+        let now = Instant::now();
+        if super::prediction_due(prediction_last_adjustment.get(), now) {
+            if let Some(luma) = prediction_luma.get() {
+                prediction_last_adjustment.set(Some(now));
+                smol::block_on(prediction_controller.borrow_mut().adjust(luma));
+            }
+        }
+    });
+    prediction_timer.update_timer(Some(super::CAPTURE_INTERVAL), Some(super::CAPTURE_INTERVAL));
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let (core, _portal_connection) = match portal {
         Some((remote, connection)) => {
@@ -191,6 +207,8 @@ fn capture(
     log::debug!("Advertising PipeWire DRM modifiers {modifiers:x?}");
     let data = Data {
         controller,
+        latest_luma,
+        last_adjustment,
         format: Default::default(),
         vulkan,
         last_frame_at: None,
@@ -245,7 +263,9 @@ fn capture(
             let now = Instant::now();
             if state
                 .last_frame_at
-                .is_some_and(|last_frame_at| now.duration_since(last_frame_at) < FRAME_INTERVAL)
+                .is_some_and(|last_frame_at| {
+                    now.duration_since(last_frame_at) < super::CAPTURE_INTERVAL
+                })
             {
                 return;
             }
@@ -284,12 +304,13 @@ fn capture(
                 .vulkan
                 .luma_percent_from_external_fd(&object)
                 .expect("Unable to process PipeWire DMA-BUF with Vulkan");
-            let mut controller = state.controller.borrow_mut();
             if state.discard_stale_inputs_before_first_frame {
-                controller.discard_stale_inputs();
+                state.controller.borrow_mut().discard_stale_inputs();
                 state.discard_stale_inputs_before_first_frame = false;
             }
-            smol::block_on(controller.adjust(luma));
+            state.latest_luma.set(Some(luma));
+            state.last_adjustment.set(Some(now));
+            smol::block_on(state.controller.borrow_mut().adjust(luma));
             processed_frames.fetch_add(1, Ordering::Relaxed);
         })
         .register()?;
