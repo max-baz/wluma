@@ -15,6 +15,7 @@ pub struct Controller {
     brightness: Brightness,
     user_tx: Sender<u64>,
     prediction_rx: Receiver<u64>,
+    prediction: Option<u64>,
     current: Option<u64>,
     target: Option<Target>,
     commands: Option<Receiver<Command>>,
@@ -58,6 +59,7 @@ impl Controller {
             brightness,
             user_tx,
             prediction_rx,
+            prediction: None,
             current: None,
             target: None,
             commands: None,
@@ -123,8 +125,9 @@ impl Controller {
                 }
 
                 // 2. check if predictor wants to set a new value
-                if let Some(desired) = predicted_value.filter(|_| !self.is_paused()) {
-                    self.update_target(desired);
+                if let Some(prediction) = predicted_value {
+                    self.prediction = Some(prediction);
+                    self.update_target(self.apply_idle_reduction(prediction));
                 }
 
                 // 3. continue the transition if there is one in progress
@@ -162,12 +165,24 @@ impl Controller {
             status.set_brightness(output, self.brightness.percent(new_brightness));
         }
         if !self.is_paused() {
-            self.user_tx
-                .send(new_brightness)
+            self.learn(new_brightness)
                 .await
                 .expect("Unable to send new brightness value set by user, channel is dead");
         }
         self.target = None;
+    }
+
+    async fn learn(&mut self, value: u64) -> anyhow::Result<()> {
+        if self.idle.is_some() {
+            log::warn!(
+                "[{}] Ignoring brightness adjustment for learning while idle",
+                self.output_name()
+            );
+            return Ok(());
+        }
+        self.prediction = Some(value);
+        self.user_tx.send(value).await?;
+        Ok(())
     }
 
     async fn command(&mut self, command: Command) {
@@ -218,7 +233,7 @@ impl Controller {
                     if let Some((status, output)) = &self.status {
                         status.set_brightness(output, self.brightness.percent(value));
                     }
-                    self.user_tx.send(value).await?;
+                    self.learn(value).await?;
                 }
             }
             CommandAction::Pause(duration) => {
@@ -262,13 +277,21 @@ impl Controller {
                 );
             }
             CommandAction::IdleEnter(percent) => {
-                let manually_paused = self.paused_until.is_some();
-                self.set_idle(Some(percent));
-                if !manually_paused {
-                    result = Some(self.dim_for_idle(percent).await?);
+                self.idle = Some(percent);
+                self.idle_changed();
+                if self.is_paused() {
+                    self.prediction = None;
+                } else {
+                    result = Some(self.apply_idle().await?);
                 }
             }
-            CommandAction::IdleLeave => self.set_idle(None),
+            CommandAction::IdleLeave => {
+                self.idle = None;
+                self.idle_changed();
+                if !self.is_paused() {
+                    result = Some(self.apply_idle().await?);
+                }
+            }
         }
         Ok(self
             .brightness
@@ -276,7 +299,7 @@ impl Controller {
     }
 
     fn is_paused(&self) -> bool {
-        self.paused_until.is_some() || self.idle.is_some()
+        self.paused_until.is_some()
     }
 
     fn set_manual_paused(&mut self, paused_until: Option<Option<Instant>>) {
@@ -285,19 +308,11 @@ impl Controller {
         self.pause_state_changed(was_paused);
     }
 
-    fn set_idle(&mut self, percent: Option<u8>) {
-        let was_paused = self.is_paused();
-        self.idle = percent;
-        self.pause_state_changed(was_paused);
-    }
-
     async fn resume_manual_pause(&mut self) -> anyhow::Result<()> {
         let was_manually_paused = self.paused_until.is_some();
         self.set_manual_paused(None);
-        if was_manually_paused {
-            if let Some(percent) = self.idle {
-                self.dim_for_idle(percent).await?;
-            }
+        if was_manually_paused && self.idle.is_some() {
+            self.apply_idle().await?;
         }
         Ok(())
     }
@@ -308,6 +323,9 @@ impl Controller {
             paused.store(is_paused, Ordering::Relaxed);
         }
         if was_paused && !is_paused {
+            if self.idle.is_none() {
+                self.prediction = None;
+            }
             self.resuming = true;
             while self.prediction_rx.try_recv().is_ok() {}
         }
@@ -317,21 +335,36 @@ impl Controller {
         }
     }
 
-    async fn dim_for_idle(&mut self, percent: u8) -> anyhow::Result<u64> {
-        let current = self.brightness.get().await?;
-        if self.current.is_none() {
-            self.user_tx.send(current).await?;
+    fn idle_changed(&mut self) {
+        self.target = None;
+        if let Some((status, output)) = &self.status {
+            status.set_pause(output, self.is_paused(), self.idle.is_some());
         }
-        let desired = current
-            .saturating_mul(percent as u64)
-            .checked_div(100)
-            .unwrap_or(0)
-            .clamp(self.brightness.min(), current);
-        let value = if desired < current {
-            self.brightness.set(desired).await?
-        } else {
-            current
+    }
+
+    fn apply_idle_reduction(&self, value: u64) -> u64 {
+        self.idle.map_or(value, |percent| {
+            (value.saturating_mul(percent as u64) / 100)
+                .clamp(self.brightness.min(), self.brightness.max())
+        })
+    }
+
+    async fn apply_idle(&mut self) -> anyhow::Result<u64> {
+        let current = self.brightness.get().await?;
+        let prediction = match self.prediction {
+            Some(prediction) => prediction,
+            None => {
+                self.prediction = Some(current);
+                if self.current.is_none() {
+                    self.user_tx.send(current).await?;
+                }
+                current
+            }
         };
+        let value = self
+            .brightness
+            .set(self.apply_idle_reduction(prediction))
+            .await?;
         self.current = Some(value);
         if let Some((status, output)) = &self.status {
             status.set_brightness(output, self.brightness.percent(value));
@@ -648,6 +681,28 @@ mod tests {
     }
 
     #[apply(test!)]
+    async fn cli_set_while_idle_is_not_learned() -> Result<()> {
+        let (mut controller, _, user_rx) = setup(brightness_mock(vec![], vec![60]));
+        controller.current = Some(30);
+        controller.prediction = Some(100);
+        controller.idle = Some(30);
+
+        let result = controller
+            .execute(CommandAction::Set(crate::control::Adjustment {
+                percent: 60,
+                relative: false,
+                increase: true,
+            }))
+            .await?;
+
+        assert_eq!(60, result);
+        assert_eq!(Some(60), controller.current);
+        assert_eq!(Some(100), controller.prediction);
+        assert!(user_rx.is_empty());
+        Ok(())
+    }
+
+    #[apply(test!)]
     async fn resumes_from_current_brightness_without_learning_it() -> Result<()> {
         let (mut controller, _, user_rx) = setup(brightness_mock(vec![50, 60], vec![60]));
         controller.current = Some(50);
@@ -686,33 +741,36 @@ mod tests {
     }
 
     #[apply(test!)]
-    async fn idle_dim_does_not_restore_or_learn() -> Result<()> {
-        let (mut controller, prediction_tx, user_rx) = setup(brightness_mock(vec![80], vec![24]));
+    async fn idle_reduction_tracks_and_restores_predictions() -> Result<()> {
+        let (mut controller, prediction_tx, user_rx) =
+            setup(brightness_mock(vec![80, 24, 23], vec![24, 23, 70]));
         controller.current = Some(80);
-        prediction_tx.send(70).await?;
 
         controller.execute(CommandAction::IdleEnter(30)).await?;
         assert_eq!(Some(24), controller.current);
-        assert!(controller.is_paused());
-        assert!(user_rx.is_empty());
+        assert!(!controller.is_paused());
+
+        prediction_tx.send(70).await?;
+        controller.step().await;
+        assert_eq!(Some(23), controller.current);
+        assert_eq!(Some(70), controller.prediction);
 
         controller.execute(CommandAction::IdleLeave).await?;
-        assert_eq!(Some(24), controller.current);
-        assert!(!controller.is_paused());
-        assert!(controller.prediction_rx.is_empty());
-        assert!(controller.resuming);
+        assert_eq!(Some(70), controller.current);
         assert!(user_rx.is_empty());
+        assert!(is_brightness_spent(&controller.brightness));
         Ok(())
     }
 
     #[apply(test!)]
     async fn idle_dim_can_turn_a_backlight_off() -> Result<()> {
-        let (mut controller, _, _) = setup(brightness_mock(vec![3], vec![0]));
+        let (mut controller, _, user_rx) = setup(brightness_mock(vec![3], vec![0]));
         controller.current = Some(3);
 
         controller.execute(CommandAction::IdleEnter(0)).await?;
 
         assert_eq!(Some(0), controller.current);
+        assert!(user_rx.is_empty());
         Ok(())
     }
 
@@ -724,6 +782,22 @@ mod tests {
 
         assert_eq!(80, user_rx.try_recv()?);
         assert_eq!(Some(24), controller.current);
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn idle_does_not_publish_a_paused_state() -> Result<()> {
+        let (mut controller, _, _) = setup(brightness_mock(vec![80], vec![24]));
+        let paused = Arc::new(AtomicBool::new(false));
+        controller.current = Some(80);
+        controller.prediction = Some(80);
+        controller.paused = Some(paused.clone());
+
+        controller.execute(CommandAction::IdleEnter(30)).await?;
+        assert!(!paused.load(Ordering::Relaxed));
+
+        controller.execute(CommandAction::Pause(None)).await?;
+        assert!(paused.load(Ordering::Relaxed));
         Ok(())
     }
 
@@ -745,17 +819,38 @@ mod tests {
     }
 
     #[apply(test!)]
-    async fn resuming_manual_pause_applies_idle_dimming() -> Result<()> {
-        let (mut controller, _, user_rx) = setup(brightness_mock(vec![80], vec![24]));
+    async fn resuming_manual_pause_applies_idle_dimming_to_current_brightness() -> Result<()> {
+        let (mut controller, _, user_rx) = setup(brightness_mock(vec![60], vec![18]));
         controller.current = Some(80);
+        controller.prediction = Some(80);
         controller.execute(CommandAction::Pause(None)).await?;
         controller.execute(CommandAction::IdleEnter(30)).await?;
 
         controller.execute(CommandAction::Resume).await?;
 
-        assert_eq!(Some(24), controller.current);
-        assert!(controller.is_paused());
+        assert_eq!(Some(18), controller.current);
+        assert_eq!(Some(60), controller.prediction);
+        assert!(!controller.is_paused());
         assert!(controller.paused_until.is_none());
+        assert!(user_rx.is_empty());
+        assert!(is_brightness_spent(&controller.brightness));
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn manual_pause_while_idle_preserves_the_prediction() -> Result<()> {
+        let (mut controller, _, user_rx) =
+            setup(brightness_mock(vec![80, 24, 24], vec![24, 24, 80]));
+        controller.current = Some(80);
+        controller.prediction = Some(80);
+        controller.execute(CommandAction::IdleEnter(30)).await?;
+        controller.execute(CommandAction::Pause(None)).await?;
+
+        controller.execute(CommandAction::Resume).await?;
+        controller.execute(CommandAction::IdleLeave).await?;
+
+        assert_eq!(Some(80), controller.current);
+        assert_eq!(Some(80), controller.prediction);
         assert!(user_rx.is_empty());
         assert!(is_brightness_spent(&controller.brightness));
         Ok(())
@@ -773,7 +868,7 @@ mod tests {
         controller.expire_pause().await;
 
         assert_eq!(Some(24), controller.current);
-        assert!(controller.is_paused());
+        assert!(!controller.is_paused());
         assert!(controller.paused_until.is_none());
         assert!(user_rx.is_empty());
         assert!(is_brightness_spent(&controller.brightness));

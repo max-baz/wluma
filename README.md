@@ -119,7 +119,7 @@ The adaptive predictor remembers your adjustments and applies them across the fu
 
 ### Idle dimming
 
-After two minutes of inactivity, wluma pauses automatic adjustment, dims displays to 30% of their current brightness and turns keyboard backlights off. These defaults can be changed globally or per power source:
+After two minutes of inactivity, wluma additionally reduces displays to 30% on top of their predicted brightness, and turns keyboard backlights off. These defaults can be changed globally or per power source:
 
 ```toml
 [idle]
@@ -134,7 +134,7 @@ timeout = 300
 brightness = 20
 ```
 
-Timeouts are in seconds. Omitted AC and battery settings inherit the global values; set `enabled = false` globally or in either profile to disable it. Wluma uses UPower to detect the current power source. When activity resumes, automatic adjustment continues with a fresh prediction rather than explicitly restoring the previous brightness.
+Timeouts are in seconds. Omitted AC and battery settings inherit the global values; set `enabled = false` globally or in either profile to disable it. Wluma uses UPower to detect the current power source. When activity resumes, the idle reduction is removed from the latest prediction.
 
 Idle detection uses `ext-idle-notify-v1`, which honors compositor idle inhibitors, with GNOME Mutter's IdleMonitor as a fallback. Disable other automatic idle dimming to avoid conflicts. On GNOME:
 

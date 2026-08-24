@@ -623,7 +623,7 @@ impl MonitorStatus {
     }
 
     fn paused(&self) -> bool {
-        self.manual_pause || self.idle_pause
+        self.manual_pause
     }
 }
 
@@ -860,6 +860,12 @@ mod tests {
             "\"idle\":{\"power_source\":\"battery\",\"state\":\"idle\",\"enabled\":true,\"timeout\":120,\"brightness\":20}"
         ));
         assert!(json.contains("\"state\":\"idle+manual\",\"paused\":true,\"idle\":true"));
+
+        hub.set_pause("eDP-1", false, true);
+        assert!(hub
+            .snapshot()
+            .json()
+            .contains("\"state\":\"idle\",\"paused\":false,\"idle\":true"));
     }
 
     #[test]
