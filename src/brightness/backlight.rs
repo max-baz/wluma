@@ -7,14 +7,32 @@ use smol::fs::{File, OpenOptions};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const TRANSITION_STEP_MS: u64 = 16;
 const BRIGHTNESS_STEPS: u64 = 1000;
+const POLLED_WRITE_SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn requires_polling(path: &Path) -> bool {
     path.parent()
         .and_then(Path::file_name)
         .is_some_and(|subsystem| subsystem == "leds")
+}
+
+fn settle_polled_write(
+    pending: &mut Option<(u64, Instant)>,
+    observed: u64,
+    cached: Option<u64>,
+    now: Instant,
+) -> u64 {
+    if let Some((expected, deadline)) = *pending {
+        if observed == expected || now >= deadline {
+            *pending = None;
+        } else {
+            return cached.unwrap_or(observed);
+        }
+    }
+    observed
 }
 
 struct Dbus {
@@ -30,6 +48,7 @@ pub struct Backlight {
     current: Option<u64>,
     dbus: Option<Dbus>,
     has_write_permission: bool,
+    pending_polled_write: Option<(u64, Instant)>,
     poll_brightness: bool,
 }
 
@@ -114,6 +133,7 @@ impl Backlight {
             current: None,
             dbus,
             has_write_permission,
+            pending_polled_write: None,
             poll_brightness,
         })
     }
@@ -126,7 +146,15 @@ impl Backlight {
         }
 
         if self.poll_brightness {
-            return update(self).await;
+            let observed = read(&mut self.file).await? as u64;
+            let value = settle_polled_write(
+                &mut self.pending_polled_write,
+                observed,
+                self.current,
+                Instant::now(),
+            );
+            self.current = Some(value.clamp(self.min_brightness, self.max_brightness));
+            return Ok(value);
         }
 
         let mut buffer = [0u8; 1024];
@@ -182,6 +210,9 @@ impl Backlight {
             Err(std::io::Error::from(ErrorKind::PermissionDenied))?
         }
 
+        if self.poll_brightness {
+            self.pending_polled_write = Some((value, Instant::now() + POLLED_WRITE_SETTLE_TIMEOUT));
+        }
         self.current = Some(value);
 
         // Consume file events to not trigger get() update
@@ -210,5 +241,25 @@ mod tests {
         assert!(!requires_polling(Path::new(
             "/sys/class/backlight/intel_backlight"
         )));
+    }
+
+    #[test]
+    fn pending_polled_write_hides_stale_brightness() {
+        let now = Instant::now();
+        let mut pending = Some((0, now + POLLED_WRITE_SETTLE_TIMEOUT));
+
+        assert_eq!(0, settle_polled_write(&mut pending, 2, Some(0), now));
+        assert!(pending.is_some());
+        assert_eq!(0, settle_polled_write(&mut pending, 0, Some(0), now));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn pending_polled_write_expires() {
+        let now = Instant::now();
+        let mut pending = Some((0, now));
+
+        assert_eq!(2, settle_polled_write(&mut pending, 2, Some(0), now));
+        assert!(pending.is_none());
     }
 }
