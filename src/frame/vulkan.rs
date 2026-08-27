@@ -13,11 +13,13 @@ use std::fs::File;
 use std::ops::Drop;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::time::{Duration, Instant};
 
 const VULKAN_VERSION: u32 = vk::make_api_version(0, 1, 2, 0);
 
 const FINAL_MIP_LEVEL: u32 = 4; // Don't generate mipmaps beyond this level - GPU is doing too poor of a job averaging the colors
 const FENCES_TIMEOUT_NS: u64 = 1_000_000_000;
+const EXTERNAL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const IMPORTED_FRAME_CACHE_SIZE: usize = 8;
 
 pub struct Vulkan {
@@ -542,6 +544,7 @@ impl Vulkan {
                 "Frames with multiple objects are not supported yet, use WLR_DRM_NO_MODIFIERS=1 as described in README and follow issue #8"
             ));
         }
+        self.wait_for_external_writes(frame)?;
         self.init_image(frame)?;
         let metadata = File::from(frame.fd(0).try_clone()?).metadata()?;
         let key = ImportedFrameKey {
@@ -577,6 +580,51 @@ impl Vulkan {
         };
 
         self.luma_percent(&frame_image)
+    }
+
+    /// Wait for the DMA-BUF producer's implicit exclusive fence.
+    ///
+    /// A PipeWire process callback transfers logical ownership of the buffer,
+    /// but it does not supply a Vulkan semaphore. Importing its fd as Vulkan
+    /// memory does not guarantee that our queue submission waits for the
+    /// compositor's implicit DMA-BUF fence. Reading too early produces an
+    /// occasional all-zero frame. DMA-BUF's poll contract exposes completion
+    /// of the exclusive (writer) fence as POLLIN.
+    fn wait_for_external_writes(&self, frame: &Object) -> Result<()> {
+        let mut poll_fd = libc::pollfd {
+            fd: frame.fd(0).as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let started = Instant::now();
+        let mut timeout_ms = EXTERNAL_WRITE_TIMEOUT.as_millis() as libc::c_int;
+        loop {
+            let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            if result > 0 {
+                if poll_fd.revents & libc::POLLIN != 0 {
+                    log::trace!(
+                        "Waited {}us for DMA-BUF producer fence",
+                        started.elapsed().as_micros()
+                    );
+                    return Ok(());
+                }
+                return Err(anyhow!(
+                    "DMA-BUF poll failed with events {:#x}",
+                    poll_fd.revents
+                ));
+            }
+            if result == 0 {
+                return Err(anyhow!("Timed out waiting for DMA-BUF producer fence"));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+            let Some(remaining) = EXTERNAL_WRITE_TIMEOUT.checked_sub(started.elapsed()) else {
+                return Err(anyhow!("Timed out waiting for DMA-BUF producer fence"));
+            };
+            timeout_ms = remaining.as_millis().max(1) as libc::c_int;
+        }
     }
 
     pub fn luma_percent_from_internal_fd(&mut self) -> Result<u8> {
