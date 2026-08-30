@@ -6,6 +6,7 @@ use super::{Als, Reading, Scale};
 
 const FILTER_TIME_CONSTANT_SECONDS: f64 = 0.5;
 const STABILIZATION_DURATION: Duration = Duration::from_secs(5);
+const DECREASING_STABILIZATION_DURATION: Duration = Duration::from_millis(500);
 const LUX_STABILIZATION_COORDINATE_TOLERANCE: f64 = 0.1;
 const LUX_STABILIZATION_ABSOLUTE_TOLERANCE: u64 = 3;
 const LINEAR_STABILIZATION_TOLERANCE: u64 = 10;
@@ -25,7 +26,13 @@ impl Candidate {
         }
     }
 
-    fn update(&mut self, scale: Scale, value: u64, now: Instant) -> bool {
+    fn update(
+        &mut self,
+        scale: Scale,
+        value: u64,
+        now: Instant,
+        stabilization_duration: Duration,
+    ) -> bool {
         let min = self.min.min(value);
         let max = self.max.max(value);
         if !near(scale, min, max) {
@@ -34,7 +41,7 @@ impl Candidate {
         } else {
             self.min = min;
             self.max = max;
-            now.duration_since(self.since) >= STABILIZATION_DURATION
+            now.duration_since(self.since) >= stabilization_duration
         }
     }
 }
@@ -57,7 +64,7 @@ impl Stabilizer {
     fn observe(&mut self, value: u64, interval: Duration, now: Instant) -> Option<Reading> {
         let Some(filtered) = self.filtered else {
             let stable = match self.candidate.as_mut() {
-                Some(candidate) => candidate.update(self.scale, value, now),
+                Some(candidate) => candidate.update(self.scale, value, now, STABILIZATION_DURATION),
                 None => {
                     self.candidate = Some(Candidate::new(value, now));
                     false
@@ -78,8 +85,13 @@ impl Stabilizer {
             return Some(self.reading(true));
         }
 
+        let stabilization_duration = if value < filtered.round() as u64 {
+            DECREASING_STABILIZATION_DURATION
+        } else {
+            STABILIZATION_DURATION
+        };
         let stable = match self.candidate.as_mut() {
-            Some(candidate) => candidate.update(self.scale, value, now),
+            Some(candidate) => candidate.update(self.scale, value, now, stabilization_duration),
             None => {
                 self.candidate = Some(Candidate::new(value, now));
                 false
@@ -254,10 +266,57 @@ mod tests {
         );
         assert_eq!(
             Some(Reading {
+                value: 10,
+                stable: false,
+            }),
+            stabilizer.observe(
+                100,
+                Duration::ZERO,
+                start + DECREASING_STABILIZATION_DURATION,
+            )
+        );
+        assert_eq!(
+            Some(Reading {
                 value: 100,
                 stable: true,
             }),
             stabilizer.observe(100, Duration::ZERO, start + STABILIZATION_DURATION)
+        );
+    }
+
+    #[test]
+    fn accepts_a_decrease_quickly() {
+        let start = Instant::now();
+        let mut stabilizer = Stabilizer::new(Scale::Linear);
+        stabilizer.filtered = Some(100.0);
+        assert_eq!(
+            Some(Reading {
+                value: 100,
+                stable: false,
+            }),
+            stabilizer.observe(10, Duration::ZERO, start)
+        );
+        assert_eq!(
+            Some(Reading {
+                value: 100,
+                stable: false,
+            }),
+            stabilizer.observe(
+                10,
+                Duration::ZERO,
+                start + DECREASING_STABILIZATION_DURATION - Duration::from_millis(1),
+            )
+        );
+        assert_eq!(
+            Some(Reading {
+                value: 10,
+                stable: true,
+            }),
+            stabilizer.observe(
+                10,
+                Duration::ZERO,
+                start + DECREASING_STABILIZATION_DURATION,
+            )
         );
     }
 
