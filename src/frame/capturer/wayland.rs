@@ -1062,8 +1062,10 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
 
             Event::DmabufFormat { format, modifiers } => {
                 let modifiers: Vec<_> = modifiers
-                    .chunks_exact(8)
-                    .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|bytes| u64::from_ne_bytes(*bytes))
                     .collect();
                 log::debug!(
                     "ext-image-copy-capture DMA-BUF format constraint: DRM format={format}, modifiers={modifiers:x?}"
