@@ -14,6 +14,8 @@ const PATH: &str = "/net/hadess/SensorProxy";
 const INTERFACE: &str = "net.hadess.SensorProxy";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+const INITIALIZATION_ATTEMPTS: usize = 5;
+const INITIALIZATION_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct Sensor {
     value_rx: Receiver<u64>,
@@ -24,6 +26,24 @@ pub struct Sensor {
 
 impl Sensor {
     pub fn new() -> Result<Self> {
+        if !service_available()? {
+            return Err(anyhow!("iio-sensor-proxy is unavailable"));
+        }
+
+        let mut error = None;
+        for attempt in 1..=INITIALIZATION_ATTEMPTS {
+            match Self::connect() {
+                Ok(sensor) => return Ok(sensor),
+                Err(current) => error = Some(current),
+            }
+            if attempt < INITIALIZATION_ATTEMPTS {
+                thread::sleep(INITIALIZATION_INTERVAL);
+            }
+        }
+        Err(error.expect("initialization loop always records an error"))
+    }
+
+    fn connect() -> Result<Self> {
         let connection = Connection::new_system()?;
         let proxy = connection.with_proxy(DESTINATION, PATH, TIMEOUT);
         let has_ambient_light: bool = proxy.get(INTERFACE, "HasAmbientLight")?;
@@ -64,8 +84,8 @@ impl Sensor {
             .with_path("/org/freedesktop/DBus");
         connection.add_match(
             owner_rule,
-            move |(name, _, _): (String, String, String), _, _| {
-                if name == DESTINATION {
+            move |(name, old_owner, new_owner): (String, String, String), _, _| {
+                if name == DESTINATION && !old_owner.is_empty() && old_owner != new_owner {
                     signal_active.store(false, Ordering::Relaxed);
                 }
                 true
@@ -119,6 +139,19 @@ impl Sensor {
 
         self.value
     }
+}
+
+fn service_available() -> Result<bool> {
+    let connection = Connection::new_system()?;
+    let proxy = connection.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", TIMEOUT);
+    let (has_owner,): (bool,) =
+        proxy.method_call("org.freedesktop.DBus", "NameHasOwner", (DESTINATION,))?;
+    if has_owner {
+        return Ok(true);
+    }
+    let (activatable,): (Vec<String>,) =
+        proxy.method_call("org.freedesktop.DBus", "ListActivatableNames", ())?;
+    Ok(activatable.iter().any(|name| name == DESTINATION))
 }
 
 impl Drop for Sensor {

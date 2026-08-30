@@ -1,35 +1,30 @@
 use anyhow::{anyhow, Context, Result};
+use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
+use dbus::blocking::Connection;
 use ddc_hi::{Ddc, Display, FeatureCode};
 use itertools::Itertools;
-use lazy_static::lazy_static;
-use smol::lock::Mutex;
-use std::process::Command;
-use std::thread;
-use std::time::Duration;
 
-lazy_static! {
-    static ref DDC_MUTEX: Mutex<()> = Mutex::new(());
-}
-
+const DESTINATION: &str = "com.ddcutil.DdcutilService";
+const PATH: &str = "/com/ddcutil/DdcutilObject";
+const INTERFACE: &str = "com.ddcutil.DdcutilInterface";
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DDC_BRIGHTNESS_FEATURE: FeatureCode = 0x10;
-const DDC_DIRECT_WAITING_SLEEP_MS: u64 = 500;
-const DDC_DIRECT_TRANSITION_STEP_MS: u64 = 50;
-const DDC_CLI_WAITING_SLEEP_MS: u64 = 800;
-const DDC_CLI_TRANSITION_STEP_MS: u64 = 100;
-const DDC_DIRECT_RETRIES: usize = 3;
-const DDC_DIRECT_RETRY_SLEEP_MS: u64 = 40;
-const DDC_INITIALIZATION_ATTEMPTS: usize = 6;
-const DDC_INITIALIZATION_RETRY_SLEEP_MS: u64 = 1000;
-const DDC_CLI_RETRIES: usize = 3;
-const DDC_CLI_RETRY_SLEEP_MS: u64 = 150;
+const DDC_WAITING_SLEEP_MS: u64 = 500;
+const DDC_TRANSITION_STEP_MS: u64 = 50;
+
+type DetectedDisplay = (i32, i32, i32, String, String, String, u16, String, u32);
 
 enum Backend {
-    Direct(Box<Mutex<Display>>),
-    Cli { bus: u32 },
+    Service(Service),
+    Raw(Display),
+}
+
+struct Service {
+    connection: Connection,
+    edid: String,
 }
 
 pub struct DdcUtil {
-    identifier: String,
     backend: Backend,
     min_brightness: u64,
     max_brightness: u64,
@@ -37,64 +32,64 @@ pub struct DdcUtil {
 
 impl DdcUtil {
     pub fn new(identifier: &str, min_brightness: u64) -> Result<Self> {
-        let direct_error = match find_display_by_identifier(identifier, true)
-            .or_else(|| find_display_by_identifier(identifier, false))
-        {
-            Some(mut display) => match initialize_direct(&mut display) {
-                Ok(max_brightness) => {
-                    return Ok(Self {
-                        identifier: identifier.to_string(),
-                        backend: Backend::Direct(Box::new(Mutex::new(display))),
-                        min_brightness,
-                        max_brightness,
-                    })
-                }
-                Err(err) => {
-                    log::warn!(
-                        "Unable to initialize '{}' with direct DDC access: {:?}. Trying ddcutil CLI fallback.",
-                        identifier,
-                        err
-                    );
-                    err.to_string()
-                }
-            },
-            None => "Unable to find display".to_string(),
-        };
-
-        let mut cli_backend =
-            Self::new_cli_backend(identifier, min_brightness).map_err(|cli_err| {
-                anyhow!(
-                    "Unable to initialize DDC display '{}' directly ({}) or via ddcutil CLI ({})",
-                    identifier,
-                    direct_error,
-                    cli_err
-                )
-            })?;
-        log::warn!(
-            "Using ddcutil CLI fallback for '{}' because direct DDC access is unreliable on this monitor.",
-            identifier
-        );
-        cli_backend.max_brightness = cli_backend.max_brightness.max(min_brightness);
-        Ok(cli_backend)
+        match Service::new(identifier) {
+            Ok((service, max_brightness)) => {
+                log::info!("Using ddcutil-service over D-Bus for DDC display '{identifier}'");
+                Ok(Self {
+                    backend: Backend::Service(service),
+                    min_brightness,
+                    max_brightness: (max_brightness as u64).max(min_brightness),
+                })
+            }
+            Err(service_error) => {
+                log::debug!(
+                    "Unable to use ddcutil-service for DDC display '{identifier}': {service_error:#}"
+                );
+                let mut display = find_raw_display(identifier)
+                    .ok_or_else(|| anyhow!("Unable to find DDC display '{identifier}'"))?;
+                let max_brightness = display
+                    .handle
+                    .get_vcp_feature(DDC_BRIGHTNESS_FEATURE)
+                    .context("Unable to read brightness over raw DDC")?
+                    .maximum() as u64;
+                log::info!(
+                    "Using raw DDC for display '{identifier}' (using ddcutil-service is recommended)"
+                );
+                Ok(Self {
+                    backend: Backend::Raw(display),
+                    min_brightness,
+                    max_brightness: max_brightness.max(min_brightness),
+                })
+            }
+        }
     }
 
     pub async fn get(&mut self) -> Result<u64> {
-        let _lock = DDC_MUTEX.lock().await;
-        match self.get_locked() {
-            Ok(value) => Ok(value),
-            Err(err) if self.switch_to_cli_locked(&err)? => self.get_locked(),
-            Err(err) => Err(err),
-        }
+        let value = match &mut self.backend {
+            Backend::Service(service) => {
+                let (current, maximum) = service.get_brightness()?;
+                self.max_brightness = (maximum as u64).max(self.min_brightness);
+                current as u64
+            }
+            Backend::Raw(display) => display
+                .handle
+                .get_vcp_feature(DDC_BRIGHTNESS_FEATURE)
+                .context("Unable to read brightness over raw DDC")?
+                .value() as u64,
+        };
+        Ok(value.clamp(self.min_brightness, self.max_brightness))
     }
 
     pub async fn set(&mut self, value: u64) -> Result<u64> {
-        let _lock = DDC_MUTEX.lock().await;
         let value = value.clamp(self.min_brightness, self.max_brightness);
-        match self.set_locked(value) {
-            Ok(set_value) => Ok(set_value),
-            Err(err) if self.switch_to_cli_locked(&err)? => self.set_locked(value),
-            Err(err) => Err(err),
+        match &mut self.backend {
+            Backend::Service(service) => service.set_brightness(value as u16)?,
+            Backend::Raw(display) => display
+                .handle
+                .set_vcp_feature(DDC_BRIGHTNESS_FEATURE, value as u16)
+                .context("Unable to set brightness over raw DDC")?,
         }
+        Ok(value)
     }
 
     pub fn min(&self) -> u64 {
@@ -106,441 +101,144 @@ impl DdcUtil {
     }
 
     pub fn waiting_sleep_ms(&self) -> u64 {
-        match &self.backend {
-            Backend::Direct(_) => DDC_DIRECT_WAITING_SLEEP_MS,
-            Backend::Cli { .. } => DDC_CLI_WAITING_SLEEP_MS,
-        }
+        DDC_WAITING_SLEEP_MS
     }
 
     pub fn transition_step_ms(&self) -> u64 {
-        match &self.backend {
-            Backend::Direct(_) => DDC_DIRECT_TRANSITION_STEP_MS,
-            Backend::Cli { .. } => DDC_CLI_TRANSITION_STEP_MS,
+        DDC_TRANSITION_STEP_MS
+    }
+}
+
+impl Service {
+    fn new(identifier: &str) -> Result<(Self, u16)> {
+        let connection =
+            Connection::new_session().context("Unable to connect to the session bus")?;
+        let proxy = connection.with_proxy(DESTINATION, PATH, TIMEOUT);
+        let version: String = proxy
+            .get(INTERFACE, "ServiceInterfaceVersion")
+            .context("ddcutil-service is unavailable")?;
+        if version.split('.').next() != Some("1") {
+            return Err(anyhow!(
+                "Unsupported ddcutil-service interface version '{version}'"
+            ));
         }
-    }
 
-    fn new_cli_backend(identifier: &str, min_brightness: u64) -> Result<Self> {
-        let bus = find_ddcutil_bus_by_identifier(identifier)?.ok_or_else(|| {
-            anyhow!(
-                "Unable to find a ddcutil display that matches '{}'",
-                identifier
-            )
-        })?;
-        let (_, max_brightness) = cli_get_brightness(bus)?;
-
-        Ok(Self {
-            identifier: identifier.to_string(),
-            backend: Backend::Cli { bus },
-            min_brightness,
-            max_brightness,
-        })
-    }
-
-    fn get_locked(&mut self) -> Result<u64> {
-        let value = match &mut self.backend {
-            Backend::Direct(display) => get_brightness_with_retry(display.get_mut()),
-            Backend::Cli { bus } => {
-                let (current, max_brightness) = cli_get_brightness(*bus)?;
-                self.max_brightness = max_brightness;
-                Ok(current)
+        let mut display = match list_displays(&connection, "ListDetected") {
+            Ok(displays) => displays
+                .into_iter()
+                .find(|display| display_matches(display, identifier)),
+            Err(error) => {
+                log::debug!("Unable to list displays through ddcutil-service: {error:#}");
+                None
             }
-        }?;
-
-        Ok(value.clamp(self.min_brightness, self.max_brightness))
-    }
-
-    fn set_locked(&mut self, value: u64) -> Result<u64> {
-        match &mut self.backend {
-            Backend::Direct(display) => set_brightness_with_retry(display.get_mut(), value),
-            Backend::Cli { bus } => {
-                cli_set_brightness(*bus, value)?;
-                Ok(value)
-            }
-        }
-    }
-
-    fn switch_to_cli_locked(&mut self, err: &anyhow::Error) -> Result<bool> {
-        if matches!(self.backend, Backend::Cli { .. }) {
-            return Ok(false);
-        }
-
-        let Some(bus) = find_ddcutil_bus_by_identifier(&self.identifier)? else {
-            return Ok(false);
         };
+        if display.is_none() {
+            display = list_displays(&connection, "Detect")?
+                .into_iter()
+                .find(|display| display_matches(display, identifier));
+        }
+        let display = display.ok_or_else(|| {
+            anyhow!("ddcutil-service could not find a display matching '{identifier}'")
+        })?;
+        let mut service = Self {
+            connection,
+            edid: display.7,
+        };
+        let (_, maximum) = service.get_brightness()?;
+        Ok((service, maximum))
+    }
 
-        let (_, max_brightness) = cli_get_brightness(bus)?;
-        log::warn!(
-            "Direct DDC access failed for '{}': {:?}. Switching to ddcutil CLI on bus {}.",
-            self.identifier,
-            err,
-            bus
-        );
-        self.backend = Backend::Cli { bus };
-        self.max_brightness = max_brightness;
-        Ok(true)
+    fn get_brightness(&mut self) -> Result<(u16, u16)> {
+        let proxy = self.connection.with_proxy(DESTINATION, PATH, TIMEOUT);
+        let (current, maximum, _, status, message): (u16, u16, String, i32, String) = proxy
+            .method_call(
+                INTERFACE,
+                "GetVcp",
+                (-1i32, self.edid.as_str(), DDC_BRIGHTNESS_FEATURE, 0u32),
+            )
+            .context("Unable to read brightness through ddcutil-service")?;
+        service_result(status, &message, "read brightness")?;
+        Ok((current, maximum))
+    }
+
+    fn set_brightness(&mut self, value: u16) -> Result<()> {
+        let proxy = self.connection.with_proxy(DESTINATION, PATH, TIMEOUT);
+        let (status, message): (i32, String) = proxy
+            .method_call(
+                INTERFACE,
+                "SetVcp",
+                (
+                    -1i32,
+                    self.edid.as_str(),
+                    DDC_BRIGHTNESS_FEATURE,
+                    value,
+                    0u32,
+                ),
+            )
+            .context("Unable to set brightness through ddcutil-service")?;
+        service_result(status, &message, "set brightness")
     }
 }
 
-fn get_max_brightness(display: &mut Display) -> Result<u64> {
-    Ok(display
-        .handle
-        .get_vcp_feature(DDC_BRIGHTNESS_FEATURE)?
-        .maximum() as u64)
-}
-
-fn initialize_direct(display: &mut Display) -> Result<u64> {
-    for attempt in 1..=DDC_INITIALIZATION_ATTEMPTS {
-        match get_max_brightness(display) {
-            Ok(max_brightness) => return Ok(max_brightness),
-            Err(error) if attempt < DDC_INITIALIZATION_ATTEMPTS => {
-                log::debug!(
-                    "Unable to initialize direct DDC (attempt {attempt}/{DDC_INITIALIZATION_ATTEMPTS}): {error:?}"
-                );
-                thread::sleep(Duration::from_millis(DDC_INITIALIZATION_RETRY_SLEEP_MS));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    unreachable!("initialization retry loop always returns before falling through")
-}
-
-fn get_brightness_with_retry(display: &mut Display) -> Result<u64> {
-    retry_ddc("read brightness", || {
-        Ok(display
-            .handle
-            .get_vcp_feature(DDC_BRIGHTNESS_FEATURE)?
-            .value() as u64)
-    })
-}
-
-fn set_brightness_with_retry(display: &mut Display, value: u64) -> Result<u64> {
-    retry_ddc("set brightness", || {
-        display
-            .handle
-            .set_vcp_feature(DDC_BRIGHTNESS_FEATURE, value as u16)?;
-        Ok(value)
-    })
-}
-
-fn retry_ddc<T, F>(operation: &str, mut action: F) -> Result<T>
-where
-    F: FnMut() -> Result<T>,
-{
-    for attempt in 1..=DDC_DIRECT_RETRIES {
-        match action() {
-            Ok(result) => return Ok(result),
-            Err(err) if attempt < DDC_DIRECT_RETRIES => {
-                log::debug!(
-                    "Failed to {} over direct DDC (attempt {}/{}): {:?}",
-                    operation,
-                    attempt,
-                    DDC_DIRECT_RETRIES,
-                    err
-                );
-                thread::sleep(Duration::from_millis(DDC_DIRECT_RETRY_SLEEP_MS));
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    unreachable!("retry loop always returns before falling through")
-}
-
-fn cli_get_brightness(bus: u32) -> Result<(u64, u64)> {
-    let bus = bus.to_string();
-    let stdout = retry_cli("read brightness via ddcutil CLI", || {
-        run_ddcutil(&["--bus", bus.as_str(), "getvcp", "10", "--terse"])
-    })?;
-
-    parse_ddcutil_getvcp_output(&stdout)
-}
-
-fn cli_set_brightness(bus: u32, value: u64) -> Result<()> {
-    let bus_arg = bus.to_string();
-    let value_arg = value.to_string();
-
-    if let Err(err) = retry_cli("set brightness via ddcutil CLI", || {
-        run_ddcutil(&[
-            "--bus",
-            bus_arg.as_str(),
-            "setvcp",
-            "10",
-            value_arg.as_str(),
-            "--noverify",
-        ])
-        .map(|_| ())
-    }) {
-        // Some monitors apply the value but still make ddcutil exit non-zero.
-        if cli_get_brightness(bus)
-            .map(|(current, _)| current == value)
-            .unwrap_or(false)
-        {
-            log::debug!(
-                "ddcutil setvcp reported an error on bus {}, but brightness is already {}.",
-                bus,
-                value
-            );
-            return Ok(());
-        }
-
-        return Err(err.context(format!(
-            "ddcutil setvcp failed on bus {} while setting brightness to {}",
-            bus, value
-        )));
-    }
-
-    Ok(())
-}
-
-fn retry_cli<T, F>(operation: &str, mut action: F) -> Result<T>
-where
-    F: FnMut() -> Result<T>,
-{
-    for attempt in 1..=DDC_CLI_RETRIES {
-        match action() {
-            Ok(result) => return Ok(result),
-            Err(err) if attempt < DDC_CLI_RETRIES => {
-                log::debug!(
-                    "Failed to {} (attempt {}/{}): {:?}",
-                    operation,
-                    attempt,
-                    DDC_CLI_RETRIES,
-                    err
-                );
-                thread::sleep(Duration::from_millis(DDC_CLI_RETRY_SLEEP_MS));
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    unreachable!("retry loop always returns before falling through")
-}
-
-fn run_ddcutil(args: &[&str]) -> Result<String> {
-    let output = Command::new("ddcutil")
-        .args(args)
-        .output()
-        .with_context(|| format!("Unable to execute ddcutil {}", args.iter().join(" ")))?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let details = match (stdout.is_empty(), stderr.is_empty()) {
-        (false, false) => format!(" stdout: {} stderr: {}", stdout, stderr),
-        (false, true) => format!(" stdout: {}", stdout),
-        (true, false) => format!(" stderr: {}", stderr),
-        (true, true) => " no output".to_string(),
-    };
-    let exit_status = output
-        .status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "terminated by signal".to_string());
-
-    Err(anyhow!(
-        "ddcutil {} failed with status {}.{}",
-        args.iter().join(" "),
-        exit_status,
-        details
-    ))
-}
-
-fn find_ddcutil_bus_by_identifier(identifier: &str) -> Result<Option<u32>> {
-    let output = Command::new("ddcutil")
-        .arg("detect")
-        .output()
-        .context("Unable to execute ddcutil detect")?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "ddcutil detect failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    Ok(
-        parse_ddcutil_detect_output(&String::from_utf8_lossy(&output.stdout))?
-            .into_iter()
-            .find_map(|display| display.matches(identifier).then_some(display.bus)),
-    )
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CliDisplay {
-    bus: u32,
-    identifiers: String,
-}
-
-impl CliDisplay {
-    fn matches(&self, identifier: &str) -> bool {
-        self.identifiers.contains(identifier)
-    }
-}
-
-fn parse_ddcutil_detect_output(output: &str) -> Result<Vec<CliDisplay>> {
-    let mut displays = Vec::new();
-    let mut current_bus = None;
-    let mut current_identifiers = Vec::new();
-    let mut current_valid = true;
-
-    for line in output.lines() {
-        let line = line.trim();
-
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.starts_with("Display ") {
-            push_cli_display(
-                &mut displays,
-                &mut current_bus,
-                &mut current_identifiers,
-                current_valid,
-            );
-            current_valid = true;
-            continue;
-        }
-
-        if line == "Invalid display" {
-            push_cli_display(
-                &mut displays,
-                &mut current_bus,
-                &mut current_identifiers,
-                current_valid,
-            );
-            current_valid = false;
-            continue;
-        }
-
-        if let Some(bus) = line.strip_prefix("I2C bus:") {
-            current_bus = Some(parse_bus_number(bus.trim())?);
-            continue;
-        }
-
-        for prefix in [
-            "Monitor:",
-            "Mfg id:",
-            "Model:",
-            "Serial number:",
-            "Binary serial number:",
-        ] {
-            if let Some(value) = line.strip_prefix(prefix) {
-                current_identifiers.push(value.trim().to_string());
-                break;
-            }
-        }
-    }
-
-    push_cli_display(
-        &mut displays,
-        &mut current_bus,
-        &mut current_identifiers,
-        current_valid,
-    );
+fn list_displays(connection: &Connection, method: &str) -> Result<Vec<DetectedDisplay>> {
+    let proxy = connection.with_proxy(DESTINATION, PATH, TIMEOUT);
+    let (_, displays, status, message): (i32, Vec<DetectedDisplay>, i32, String) = proxy
+        .method_call(INTERFACE, method, (0u32,))
+        .with_context(|| format!("Unable to call ddcutil-service {method}"))?;
+    service_result(status, &message, "detect displays")?;
     Ok(displays)
 }
 
-fn push_cli_display(
-    displays: &mut Vec<CliDisplay>,
-    current_bus: &mut Option<u32>,
-    current_identifiers: &mut Vec<String>,
-    current_valid: bool,
-) {
-    let bus = current_bus.take();
-    let identifiers = std::mem::take(current_identifiers).join(" ");
-
-    if let (true, Some(bus), false) = (current_valid, bus, identifiers.is_empty()) {
-        displays.push(CliDisplay { bus, identifiers });
+fn service_result(status: i32, message: &str, operation: &str) -> Result<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "ddcutil-service failed to {operation}: {message} (status {status})"
+        ))
     }
 }
 
-fn parse_bus_number(bus: &str) -> Result<u32> {
-    bus.rsplit('-')
-        .next()
-        .ok_or_else(|| anyhow!("Unable to parse ddcutil bus '{}': missing bus suffix", bus))?
-        .parse()
-        .context("Unable to parse ddcutil bus number")
+fn display_matches(display: &DetectedDisplay, identifier: &str) -> bool {
+    format!(
+        "{} {} {} {}",
+        display.3,
+        display.4,
+        display.5,
+        binary_serial_identifiers(display.8)
+    )
+    .contains(identifier)
 }
 
-fn parse_ddcutil_getvcp_output(output: &str) -> Result<(u64, u64)> {
-    let line = output
-        .lines()
-        .find(|line| line.trim_start().starts_with("VCP "))
-        .ok_or_else(|| {
-            anyhow!(
-                "ddcutil getvcp returned unexpected output: {}",
-                output.trim()
-            )
-        })?;
-    let parts = line.split_whitespace().collect_vec();
-
-    if parts.len() < 5 {
-        return Err(anyhow!(
-            "ddcutil getvcp returned unexpected terse output: {}",
-            line
-        ));
-    }
-
-    let current = parts[3]
-        .parse::<u64>()
-        .context("Unable to parse current brightness from ddcutil getvcp output")?;
-    let maximum = parts[4]
-        .parse::<u64>()
-        .context("Unable to parse max brightness from ddcutil getvcp output")?;
-
-    Ok((current, maximum))
-}
-
-fn find_display_by_identifier(identifier: &str, check_caps: bool) -> Option<Display> {
-    let displays = ddc_hi::Display::enumerate()
+fn find_raw_display(identifier: &str) -> Option<Display> {
+    let displays = Display::enumerate()
         .into_iter()
-        .filter_map(|mut display| {
-            let caps = if check_caps {
-                display.update_capabilities()
-            } else {
-                Ok(())
-            };
-            caps.ok().map(|_| {
-                let empty = "".to_string();
-                let merged = format!(
-                    "{} {} {} {}",
-                    display.info.model_name.as_ref().unwrap_or(&empty),
-                    display.info.serial_number.as_ref().unwrap_or(&empty),
-                    display.info.manufacturer_id.as_ref().unwrap_or(&empty),
-                    display
-                        .info
-                        .serial
-                        .map(binary_serial_identifiers)
-                        .unwrap_or_default()
-                );
-                (merged, display)
-            })
-        })
+        .map(|display| (raw_display_identifiers(&display), display))
         .collect_vec();
-
     log::debug!(
-        "Discovered displays (check_caps={}): {:?}",
-        check_caps,
-        displays.iter().map(|(name, _)| name).collect_vec()
+        "Discovered raw DDC displays: {:?}",
+        displays
+            .iter()
+            .map(|(identifiers, _)| identifiers)
+            .collect_vec()
     );
+    displays
+        .into_iter()
+        .find_map(|(identifiers, display)| identifiers.contains(identifier).then_some(display))
+}
 
-    displays.into_iter().find_map(|(merged, display)| {
-        merged
-            .contains(identifier)
-            .then(|| {
-                log::debug!(
-                    "Using display '{}' for config '{}' (check_caps={})",
-                    merged,
-                    identifier,
-                    check_caps
-                );
-            })
-            .map(|_| display)
-    })
+fn raw_display_identifiers(display: &Display) -> String {
+    format!(
+        "{} {} {} {}",
+        display.info.model_name.as_deref().unwrap_or_default(),
+        display.info.serial_number.as_deref().unwrap_or_default(),
+        display.info.manufacturer_id.as_deref().unwrap_or_default(),
+        display
+            .info
+            .serial
+            .map(binary_serial_identifiers)
+            .unwrap_or_default()
+    )
 }
 
 fn binary_serial_identifiers(value: u32) -> String {
@@ -552,49 +250,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_binary_serial_identifiers() {
+    fn matches_service_display_identifiers() {
+        let display = (
+            1,
+            0,
+            0,
+            "GSM".to_string(),
+            "LG ULTRAWIDE".to_string(),
+            "504AZER5F964".to_string(),
+            0,
+            "edid".to_string(),
+            0x1234abcd,
+        );
+        assert!(display_matches(&display, "LG ULTRAWIDE"));
+        assert!(display_matches(&display, "504AZER5F964"));
+        assert!(display_matches(&display, "305441741"));
+        assert!(display_matches(&display, "0x1234abcd"));
+        assert!(!display_matches(&display, "missing"));
+    }
+
+    #[test]
+    fn formats_binary_serial_identifiers() {
         assert_eq!(
             binary_serial_identifiers(0x1234abcd),
             "305441741 0x1234abcd"
         );
-    }
-
-    #[test]
-    fn test_parse_ddcutil_detect_output() -> Result<()> {
-        let output = r#"
-Invalid display
-   I2C bus:          /dev/i2c-4
-   DRM connector:    card1-eDP-1
-   Monitor:          AUO::
-
-Display 1
-   I2C bus:          /dev/i2c-12
-   DRM connector:    card0-HDMI-A-3
-   EDID synopsis:
-      Mfg id:               GSM
-      Model:                LG ULTRAWIDE
-      Serial number:        504AZER5F964
-      Binary serial number: 305441741 (0x1234abcd)
-"#;
-
-        let displays = parse_ddcutil_detect_output(output)?;
-        assert_eq!(
-            displays,
-            vec![CliDisplay {
-                bus: 12,
-                identifiers: "GSM LG ULTRAWIDE 504AZER5F964 305441741 (0x1234abcd)".to_string(),
-            }]
-        );
-        assert!(displays[0].matches("0x1234abcd"));
-        assert!(displays[0].matches("305441741"));
-        assert!(displays[0].matches("504AZER5F964"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_ddcutil_getvcp_output() -> Result<()> {
-        assert_eq!(parse_ddcutil_getvcp_output("VCP 10 C 27 100")?, (27, 100));
-        Ok(())
     }
 }

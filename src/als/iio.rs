@@ -51,7 +51,7 @@ impl Als {
     pub async fn new(base_path: Option<&str>) -> Result<Self> {
         let source = match smol::unblock(super::sensor_proxy::Sensor::new).await {
             Ok(sensor) => {
-                log::debug!("Using iio-sensor-proxy for ambient light");
+                log::info!("Using iio-sensor-proxy for ambient light sensing");
                 Source::SensorProxy(Mutex::new(sensor))
             }
             Err(proxy_error) => {
@@ -61,7 +61,11 @@ impl Als {
                         "Unable to use iio-sensor-proxy and no IIO path is configured: {proxy_error}"
                     )
                 })?;
-                Source::Sysfs(Box::new(find_sensor(base_path).await?))
+                let sensor = find_sensor(base_path).await?;
+                log::info!(
+                    "Using IIO sysfs for ambient light sensing (using iio-sensor-proxy is recommended)"
+                );
+                Source::Sysfs(Box::new(sensor))
             }
         };
 

@@ -100,10 +100,6 @@ impl Als {
             if let Ok(source) = iio::Als::new(Some("/sys/bus/iio/devices")).await {
                 match source.get().await {
                     Ok(value) => {
-                        log::info!(
-                            "Using IIO ambient light sensor via {}",
-                            source.backend_name()
-                        );
                         self.switch(&mut state, Source::Iio(source));
                         return Ok(Some(value));
                     }
