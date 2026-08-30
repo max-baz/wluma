@@ -84,7 +84,10 @@ pub(super) fn source(
         proxy.method_call(INTERFACE, "SelectSources", (session_path.clone(), options))
     })?;
 
-    log::info!("Select the monitor for output '{output_name}' in the screen sharing dialog");
+    let selection_message =
+        format!("Select the monitor for output '{output_name}' in the screen sharing dialog");
+    log::info!("{selection_message}");
+    notify_monitor_selection(&connection, &selection_message);
     let result = request(&connection, options(), deadline, active, |options| {
         proxy.method_call(INTERFACE, "Start", (session_path.clone(), "", options))
     })?;
@@ -194,6 +197,31 @@ where
 
 fn options() -> PropMap {
     HashMap::<String, Variant<Box<dyn RefArg>>>::new()
+}
+
+fn notify_monitor_selection(connection: &Connection, message: &str) {
+    let proxy = connection.with_proxy(
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        TIMEOUT,
+    );
+    let result: Result<(u32,), dbus::Error> = proxy.method_call(
+        "org.freedesktop.Notifications",
+        "Notify",
+        (
+            "wluma",
+            0_u32,
+            "",
+            "wluma screen capture",
+            message,
+            Vec::<String>::new(),
+            PropMap::new(),
+            -1_i32,
+        ),
+    );
+    if let Err(error) = result {
+        log::warn!("Unable to show screen selection notification: {error}");
+    }
 }
 
 fn restore_token(output_name: &str) -> Result<Option<String>> {
