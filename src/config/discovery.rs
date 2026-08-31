@@ -160,8 +160,7 @@ fn connectors() -> Vec<Connector> {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("card") && name.contains('-'))
-                && fs::read_to_string(path.join("status"))
-                    .is_ok_and(|status| status.trim() == "connected")
+                && connector_is_active(path)
         })
         .filter_map(|path| {
             let name = path.file_name()?.to_str()?.split_once('-')?.1.to_string();
@@ -169,6 +168,25 @@ fn connectors() -> Vec<Connector> {
             Some(Connector { name, path, edid })
         })
         .collect()
+}
+
+fn connector_is_active(path: &Path) -> bool {
+    if !fs::read_to_string(path.join("status")).is_ok_and(|status| status.trim() == "connected") {
+        return false;
+    }
+
+    // A connector remains physically "connected" while DPMS has powered its
+    // display down. Exclude powered-down connectors so the runtime suspends
+    // capture and brightness I/O until the compositor wakes them again. These
+    // files are not present with every DRM driver, so absence means active.
+    let enabled = fs::read_to_string(path.join("enabled")).ok();
+    let dpms = fs::read_to_string(path.join("dpms")).ok();
+    connector_power_is_active(enabled.as_deref(), dpms.as_deref())
+}
+
+fn connector_power_is_active(enabled: Option<&str>, dpms: Option<&str>) -> bool {
+    !enabled.is_some_and(|value| value.trim() == "disabled")
+        && !dpms.is_some_and(|value| value.trim() == "Off")
 }
 
 fn backlights(connectors: &[Connector]) -> Vec<Backlight> {
@@ -433,6 +451,14 @@ mod tests {
         let backlights = vec![discovered_backlight("apple-panel-bl")];
 
         assert_eq!(fallback_backlight(&connectors, &backlights), Some((0, 0)));
+    }
+
+    #[test]
+    fn powered_down_connectors_are_inactive() {
+        assert!(connector_power_is_active(Some("enabled\n"), Some("On\n")));
+        assert!(!connector_power_is_active(Some("disabled\n"), Some("On\n")));
+        assert!(!connector_power_is_active(Some("enabled\n"), Some("Off\n")));
+        assert!(connector_power_is_active(None, None));
     }
 
     #[test]

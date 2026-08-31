@@ -3,7 +3,7 @@ use anyhow::Result;
 use futures_util::future::join_all;
 use smol::channel::{self, Receiver, Sender};
 use smol::Task;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ pub struct Runtime {
     desired: HashMap<String, config::Output>,
     sessions: HashMap<String, Session>,
     failures: HashMap<String, Instant>,
+    started: HashSet<String>,
     last_discovery: Option<Instant>,
     settling_until: Option<Instant>,
     commands: Receiver<crate::control::Command>,
@@ -66,6 +67,7 @@ impl Runtime {
             desired: HashMap::new(),
             sessions: HashMap::new(),
             failures: HashMap::new(),
+            started: HashSet::new(),
             last_discovery: None,
             settling_until: None,
             commands,
@@ -424,6 +426,10 @@ impl Runtime {
             .iter()
             .filter(|(name, _)| !self.sessions.contains_key(*name))
             .filter(|_| self.settling_until.is_none())
+            // Starting a powered-down or just-waking output can trigger an
+            // interactive portal fallback and can mistake wake-up brightness
+            // for a user preference. Wait for the idle monitor to resume.
+            .filter(|_| self.idle_brightness.is_none())
             .filter(|(name, _)| {
                 self.failures
                     .get(*name)
@@ -432,8 +438,10 @@ impl Runtime {
             .map(|(name, output)| (name.clone(), output.clone()))
             .collect::<Vec<_>>();
         for (name, output) in pending {
+            let learn_initial = !self.started.contains(&name);
             match Session::start(
                 output,
+                learn_initial,
                 self.als_scale,
                 &self.legacy_thresholds,
                 &self.registrations,
@@ -444,18 +452,9 @@ impl Runtime {
             {
                 Ok(session) => {
                     log::info!("Started using output '{name}'");
-                    let keyboard = is_keyboard(&session.output);
                     self.sessions.insert(name.clone(), session);
                     self.failures.remove(&name);
-                    if let Some(percent) = self.idle_brightness {
-                        let percent = if keyboard { 0 } else { percent };
-                        if let Err(error) = self
-                            .output_command(&name, brightness::CommandAction::IdleEnter(percent))
-                            .await
-                        {
-                            log::warn!("Unable to update idle brightness for '{name}': {error}");
-                        }
-                    }
+                    self.started.insert(name);
                 }
                 Err(error) => {
                     log::warn!("Unable to initialize output '{name}': {error:#}");
@@ -469,6 +468,7 @@ impl Runtime {
 impl Session {
     async fn start(
         output: config::Output,
+        learn_initial: bool,
         als_scale: als::Scale,
         legacy_thresholds: &HashMap<u64, String>,
         registrations: &Sender<Sender<als::Reading>>,
@@ -629,8 +629,8 @@ impl Session {
                     als_scale,
                 ))
             }
-            config::Predictor::Adaptive => predictor::Controller::adaptive(
-                predictor::controller::adaptive::Controller::new(
+            config::Predictor::Adaptive => {
+                let controller = predictor::controller::adaptive::Controller::new(
                     prediction_tx,
                     user_rx,
                     als_rx,
@@ -639,8 +639,13 @@ impl Session {
                     als_scale,
                     legacy_thresholds,
                 )
-                .with_als_direction(als_direction),
-            ),
+                .with_als_direction(als_direction);
+                predictor::Controller::adaptive(if learn_initial {
+                    controller
+                } else {
+                    controller.without_initial_value()
+                })
+            }
         }
         .with_additional(additional)
         .with_status(status.clone(), name.clone(), paused);

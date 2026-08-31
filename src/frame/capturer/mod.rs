@@ -275,11 +275,12 @@ fn select_and_run(
         controller = attempt.controller;
         match attempt.result {
             Ok(()) => return Ok(()),
-            Err(error) if probe_is_established(attempt.frames) => {
+            Err(error)
+                if probe_is_established(attempt.frames)
+                    || retry_same_candidate_after_setup_failure(&candidate, &error) =>
+            {
                 controller.discard_stale_inputs();
-                log::warn!(
-                    "Established {candidate} screen capture failed for '{output}': {error:#}"
-                );
+                log::warn!("Selected {candidate} screen capture failed for '{output}': {error:#}");
                 return run_selected(
                     candidate,
                     output,
@@ -353,6 +354,15 @@ fn pipewire_candidates() -> Vec<Candidate> {
 
 fn probe_is_established(frames: usize) -> bool {
     frames >= PROBATION_FRAMES
+}
+
+fn retry_same_candidate_after_setup_failure(candidate: &Candidate, error: &anyhow::Error) -> bool {
+    matches!(
+        candidate,
+        Candidate::Pipewire(crate::config::PipewireProtocol::Mutter)
+    ) && error
+        .chain()
+        .any(|cause| cause.to_string().contains("Session creation inhibited"))
 }
 
 fn allows_degraded_mode(family: CandidateFamily) -> bool {
@@ -434,6 +444,23 @@ mod tests {
         assert!(!probe_is_established(0));
         assert!(!probe_is_established(PROBATION_FRAMES - 1));
         assert!(probe_is_established(PROBATION_FRAMES));
+    }
+
+    #[test]
+    fn inhibited_mutter_capture_does_not_fall_back_to_portal() {
+        let error = anyhow::anyhow!("Session creation inhibited");
+        assert!(retry_same_candidate_after_setup_failure(
+            &Candidate::Pipewire(crate::config::PipewireProtocol::Mutter),
+            &error
+        ));
+        assert!(!retry_same_candidate_after_setup_failure(
+            &Candidate::Pipewire(crate::config::PipewireProtocol::Kwin),
+            &error
+        ));
+        assert!(!retry_same_candidate_after_setup_failure(
+            &Candidate::Pipewire(crate::config::PipewireProtocol::Mutter),
+            &anyhow::anyhow!("service unavailable")
+        ));
     }
 
     #[test]
