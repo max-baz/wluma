@@ -195,11 +195,11 @@ fn dispatch_until_readable(
     active: &AtomicBool,
 ) -> Result<()> {
     if !active.load(Ordering::Relaxed) {
-        return Err(anyhow!("KWin screen capture setup was interrupted"));
+        return Err(anyhow!("Wayland output lookup was interrupted"));
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(anyhow!("Timed out waiting for KWin screen capture setup"));
+        return Err(anyhow!("Timed out waiting for Wayland output lookup"));
     }
     queue.dispatch_pending(state)?;
     connection.flush()?;

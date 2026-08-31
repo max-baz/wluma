@@ -156,18 +156,20 @@ fn keyboards() -> Vec<app::Output> {
 fn connectors() -> Vec<Connector> {
     read_dir("/sys/class/drm")
         .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("card") && name.contains('-'))
-                && connector_is_active(path)
-        })
+        .filter(|path| connector_name(path).is_some() && connector_is_active(path))
         .filter_map(|path| {
-            let name = path.file_name()?.to_str()?.split_once('-')?.1.to_string();
+            let name = connector_name(&path)?.to_string();
             let edid = fs::read(path.join("edid")).unwrap_or_default();
             Some(Connector { name, path, edid })
         })
         .collect()
+}
+
+fn connector_name(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    name.starts_with("card")
+        .then(|| name.split_once('-').map(|(_, connector)| connector))
+        .flatten()
 }
 
 fn connector_is_active(path: &Path) -> bool {
@@ -186,7 +188,36 @@ fn connector_is_active(path: &Path) -> bool {
 
 fn connector_power_is_active(enabled: Option<&str>, dpms: Option<&str>) -> bool {
     !enabled.is_some_and(|value| value.trim() == "disabled")
-        && !dpms.is_some_and(|value| value.trim() == "Off")
+        && dpms.is_none_or(|value| value.trim() == "On")
+}
+
+fn configured_output_is_inactive(output: &app::Output) -> bool {
+    let output_name = name(output);
+    let backlight_path = match output {
+        app::Output::Backlight(output) if !output.path.is_empty() => {
+            Some(fs::canonicalize(&output.path).unwrap_or_else(|_| PathBuf::from(&output.path)))
+        }
+        _ => None,
+    };
+    let mut matched = false;
+    let mut active = false;
+
+    for path in read_dir("/sys/class/drm") {
+        let Some(connector_name) = connector_name(&path) else {
+            continue;
+        };
+        let connector_path = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if connector_name == output_name
+            || backlight_path
+                .as_ref()
+                .is_some_and(|backlight| backlight.starts_with(&connector_path))
+        {
+            matched = true;
+            active |= connector_is_active(&path);
+        }
+    }
+
+    matched && !active
 }
 
 fn backlights(connectors: &[Connector]) -> Vec<Backlight> {
@@ -314,7 +345,9 @@ pub fn merge(configured: Vec<app::Output>, mut detected: Vec<app::Output>) -> Ve
             let mut detected_output = detected.remove(position);
             apply_overrides(&mut detected_output, configured_output);
             outputs.push(detected_output);
-        } else if has_brightness_path(&configured_output) {
+        } else if has_brightness_path(&configured_output)
+            && !configured_output_is_inactive(&configured_output)
+        {
             outputs.push(configured_output);
         } else {
             log::debug!(
@@ -457,6 +490,14 @@ mod tests {
     fn powered_down_connectors_are_inactive() {
         assert!(connector_power_is_active(Some("enabled\n"), Some("On\n")));
         assert!(!connector_power_is_active(Some("disabled\n"), Some("On\n")));
+        assert!(!connector_power_is_active(
+            Some("enabled\n"),
+            Some("Standby\n")
+        ));
+        assert!(!connector_power_is_active(
+            Some("enabled\n"),
+            Some("Suspend\n")
+        ));
         assert!(!connector_power_is_active(Some("enabled\n"), Some("Off\n")));
         assert!(connector_power_is_active(None, None));
     }

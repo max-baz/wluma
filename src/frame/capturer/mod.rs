@@ -273,6 +273,9 @@ fn select_and_run(
             },
         );
         controller = attempt.controller;
+        if !active.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         match attempt.result {
             Ok(()) => return Ok(()),
             Err(error)
@@ -394,6 +397,9 @@ fn run_selected(
             },
         );
         controller = attempt.controller;
+        if !active.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         match attempt.result {
             Ok(()) => return Ok(()),
             Err(error) => {
