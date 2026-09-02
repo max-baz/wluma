@@ -15,7 +15,7 @@ impl Capturer {
     ) {
         while active.load(Ordering::Relaxed) {
             controller.adjust(0).await;
-            let deadline = Instant::now() + super::PREDICTION_INTERVAL;
+            let deadline = Instant::now() + super::ALS_ONLY_PREDICTION_INTERVAL;
             while active.load(Ordering::Relaxed) && Instant::now() < deadline {
                 Timer::after(
                     Duration::from_millis(100)

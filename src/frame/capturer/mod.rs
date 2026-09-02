@@ -13,6 +13,7 @@ const PORTAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const PROBATION_FRAMES: usize = 3;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(100);
+const ALS_ONLY_PREDICTION_INTERVAL: Duration = Duration::from_millis(200);
 const PREDICTION_INTERVAL: Duration = Duration::from_secs(60);
 
 fn prediction_due(last_adjustment: Option<Instant>, now: Instant) -> bool {
@@ -324,7 +325,7 @@ fn select_and_run(
     log::warn!("No screen capturer is available for '{output}', using ALS only");
     while active.load(Ordering::Relaxed) {
         smol::block_on(controller.adjust(0));
-        if !wait_while_active(&active, PREDICTION_INTERVAL) {
+        if !wait_while_active(&active, ALS_ONLY_PREDICTION_INTERVAL) {
             return Ok(());
         }
     }
