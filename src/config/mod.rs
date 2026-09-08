@@ -78,7 +78,8 @@ fn validate_manual_points(als: &app::Als, output: &[app::Output]) -> Result<()> 
             scale: crate::als::Scale::Lux,
             ..
         }
-        | app::Als::Iio { .. } => None,
+        | app::Als::Iio { .. }
+        | app::Als::Applesmc { .. } => None,
     };
     let Some(limit) = limit else {
         return Ok(());
@@ -294,6 +295,10 @@ fn parse_file_config(file_config: file::Config) -> Result<app::Config> {
                     .unwrap_or_else(default_iio_thresholds),
             }
         }
+        Some(file::Als::Applesmc { path }) => app::Als::Applesmc {
+            path,
+            thresholds: default_iio_thresholds(),
+        },
         Some(file::Als::Webcam { video, thresholds }) => {
             if thresholds.is_some() {
                 log::warn!("ALS thresholds are obsolete and are only used to migrate learned data");
@@ -518,6 +523,55 @@ thresholds = { 0 = "night" }
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn test_applesmc_path_is_optional() {
+        let config = parse_config_str("[als.applesmc]").unwrap();
+        assert!(!format!("{config:#?}").contains("thresholds"));
+        match config.als {
+            app::Als::Applesmc { path, .. } => assert_eq!(path, None),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_applesmc_path_can_be_configured() {
+        let config = parse_config_str(
+            r#"
+[als.applesmc]
+path = "/sys/devices/platform/applesmc.768/light"
+"#,
+        )
+        .unwrap();
+        match config.als {
+            app::Als::Applesmc { path, .. } => {
+                assert_eq!(
+                    path.as_deref(),
+                    Some("/sys/devices/platform/applesmc.768/light")
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_applesmc_manual_points_are_unbounded() {
+        let config = parse_config_str(
+            r#"
+[als.applesmc]
+
+[[output.backlight]]
+name = "panel"
+[output.backlight.predictor.manual]
+[[output.backlight.predictor.manual.points]]
+als = 900
+luma = 50
+reduction = 20
+"#,
+        )
+        .unwrap();
+        assert!(matches!(config.als, app::Als::Applesmc { .. }));
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub enum Als {
         path: Option<String>,
         thresholds: Option<HashMap<String, String>>,
     },
+    Applesmc {
+        path: Option<String>,
+    },
     Time {
         levels: Option<HashMap<String, u64>>,
         thresholds: Option<HashMap<String, String>>,

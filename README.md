@@ -76,13 +76,20 @@ The configuration is entirely optional, as everything is auto-detected to the be
 
 ### ALS
 
-When ALS configuration is omitted, wluma uses an external ALS whenever `$XDG_RUNTIME_DIR/wluma/als.sock` is a Unix socket, otherwise it uses an available IIO ambient light sensor or continues without one. This selection is updated while wluma is running as sources appear and disappear. For IIO it first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`.
+When ALS configuration is omitted, wluma uses an external ALS whenever `$XDG_RUNTIME_DIR/wluma/als.sock` is a Unix socket, otherwise it uses an available IIO ambient light sensor, then the Apple SMC sensor of an Intel MacBook, or continues without one. This selection is updated while wluma is running as sources appear and disappear. For IIO it first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`.
 
-Explicit `[als.external]`, `[als.iio]`, `[als.webcam]`, `[als.time]` and `[als.none]` sections override automatic selection. The IIO `path` enables direct polling from a different sysfs directory when `iio-sensor-proxy` is unavailable.
+Explicit `[als.external]`, `[als.iio]`, `[als.applesmc]`, `[als.webcam]`, `[als.time]` and `[als.none]` sections override automatic selection. The IIO `path` enables direct polling from a different sysfs directory when `iio-sensor-proxy` is unavailable.
 
 ```toml
 [als.iio]
 path = "/sys/bus/iio/devices"
+```
+
+Intel MacBooks expose their ambient light sensor through the `applesmc` platform driver instead of IIO, as `/sys/devices/platform/applesmc.<id>/light` with the format `(left,right)`. Older models report one 8-bit value per side, newer ones a single 10-bit value in the left slot. wluma uses the brighter slot as a raw illuminance reading on the `lux` scale. The `path` is optional; when omitted, the first `applesmc.*` device with a `light` file is used:
+
+```toml
+[als.applesmc]
+path = "/sys/devices/platform/applesmc.768/light"
 ```
 
 An external ALS is a Unix stream socket server that sends one non-negative decimal value per line. It should send values as soon as they become available and at least once every two seconds, including when unchanged. The path defaults to `$XDG_RUNTIME_DIR/wluma/als.sock` and the scale defaults to `lux`:

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::time::Duration;
 
+pub mod applesmc;
 pub mod auto;
 pub mod controller;
 pub mod external;
@@ -49,6 +50,7 @@ pub enum Als {
     Webcam(webcam::Als),
     External(external::Als),
     Iio(iio::Als),
+    Applesmc(applesmc::Als),
     Time(time::Als),
     None(none::Als),
 }
@@ -60,6 +62,7 @@ impl Als {
             Self::Webcam(als) => als.get().await,
             Self::External(als) => als.get().await.map(Some),
             Self::Iio(als) => als.get().await.map(Some),
+            Self::Applesmc(als) => als.get().await.map(Some),
             Self::Time(als) => als.get().await.map(Some),
             Self::None(als) => als.get().await.map(Some),
         }
@@ -70,6 +73,7 @@ impl Als {
             Self::Auto(als) => als.kind().await,
             Self::External(_) => "external",
             Self::Iio(als) => als.backend_name(),
+            Self::Applesmc(_) => "applesmc",
             Self::Webcam(_) => "webcam",
             Self::Time(_) => "time",
             Self::None(_) => "none",
@@ -81,6 +85,7 @@ impl Als {
             Self::Auto(als) => als.poll_interval(),
             Self::External(als) => als.poll_interval(),
             Self::Iio(als) => als.poll_interval(),
+            Self::Applesmc(als) => als.poll_interval(),
             Self::Webcam(_) | Self::Time(_) | Self::None(_) => DEFAULT_POLL_INTERVAL,
         }
     }
@@ -89,7 +94,7 @@ impl Als {
         match self {
             Self::Auto(_) => Scale::Lux,
             Self::External(als) => als.scale(),
-            Self::Iio(_) => Scale::Lux,
+            Self::Iio(_) | Self::Applesmc(_) => Scale::Lux,
             Self::Webcam(_) | Self::Time(_) | Self::None(_) => Scale::Linear,
         }
     }

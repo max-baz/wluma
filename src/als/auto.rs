@@ -1,4 +1,4 @@
-use super::{external, iio};
+use super::{applesmc, external, iio};
 use anyhow::Result;
 use smol::lock::Mutex;
 use std::fs;
@@ -20,11 +20,13 @@ struct State {
     source: Source,
     last_external_probe: Option<Instant>,
     last_iio_probe: Option<Instant>,
+    last_applesmc_probe: Option<Instant>,
 }
 
 enum Source {
     External(external::Als),
     Iio(iio::Als),
+    Applesmc(applesmc::Als),
     None,
 }
 
@@ -37,6 +39,7 @@ impl Als {
                 source: Source::None,
                 last_external_probe: None,
                 last_iio_probe: None,
+                last_applesmc_probe: None,
             }),
             generation: AtomicU64::new(0),
             poll_interval_ms: AtomicU64::new(super::DEFAULT_POLL_INTERVAL.as_millis() as u64),
@@ -91,6 +94,16 @@ impl Als {
             }
         }
 
+        if let Source::Applesmc(source) = &state.source {
+            match source.get().await {
+                Ok(value) => return Ok(Some(value)),
+                Err(error) => {
+                    log::info!("Apple SMC ambient light sensor disappeared: {error:#}");
+                    self.switch(&mut state, Source::None);
+                }
+            }
+        }
+
         let now = Instant::now();
         let probe = state
             .last_iio_probe
@@ -108,6 +121,25 @@ impl Als {
             }
         }
 
+        let probe = state
+            .last_applesmc_probe
+            .is_none_or(|last| now.duration_since(last) >= PROBE_INTERVAL);
+        if probe {
+            state.last_applesmc_probe = Some(now);
+            match applesmc::Als::new(None).await {
+                Ok(source) => match source.get().await {
+                    Ok(value) => {
+                        self.switch(&mut state, Source::Applesmc(source));
+                        return Ok(Some(value));
+                    }
+                    Err(error) => {
+                        log::debug!("Unable to read detected Apple SMC sensor: {error:#}")
+                    }
+                },
+                Err(error) => log::trace!("No Apple SMC ambient light sensor: {error:#}"),
+            }
+        }
+
         Ok(Some(0))
     }
 
@@ -115,6 +147,7 @@ impl Als {
         match &self.state.lock().await.source {
             Source::External(_) => "external",
             Source::Iio(source) => source.backend_name(),
+            Source::Applesmc(_) => "applesmc",
             Source::None => "none",
         }
     }
@@ -131,6 +164,7 @@ impl Als {
         let poll_interval = match &source {
             Source::External(source) => source.poll_interval(),
             Source::Iio(source) => source.poll_interval(),
+            Source::Applesmc(source) => source.poll_interval(),
             Source::None => super::DEFAULT_POLL_INTERVAL,
         };
         state.source = source;

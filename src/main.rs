@@ -77,6 +77,7 @@ async fn main() -> ExitCode {
         config::Als::Auto { .. } => "auto",
         config::Als::External { .. } => "external",
         config::Als::Iio { .. } => "iio",
+        config::Als::Applesmc { .. } => "applesmc",
         config::Als::Time { .. } => "time",
         config::Als::Webcam { .. } => "webcam",
         config::Als::None => "none",
@@ -84,9 +85,9 @@ async fn main() -> ExitCode {
     let status = control::Hub::new(als_kind);
 
     let (als_scale, legacy_thresholds) = match &config.als {
-        config::Als::Auto { thresholds } | config::Als::Iio { thresholds, .. } => {
-            (als::Scale::Lux, thresholds.clone())
-        }
+        config::Als::Auto { thresholds }
+        | config::Als::Iio { thresholds, .. }
+        | config::Als::Applesmc { thresholds, .. } => (als::Scale::Lux, thresholds.clone()),
         config::Als::External {
             scale, thresholds, ..
         } => (*scale, thresholds.clone()),
@@ -110,6 +111,11 @@ async fn main() -> ExitCode {
             als::iio::Als::new(path.as_deref())
                 .await
                 .expect("Unable to initialize ambient light sensor"),
+        ),
+        config::Als::Applesmc { path, .. } => als::Als::Applesmc(
+            als::applesmc::Als::new(path.as_deref())
+                .await
+                .expect("Unable to initialize Apple SMC ambient light sensor"),
         ),
         config::Als::Time { levels, .. } => als::Als::Time(
             als::time::Als::new(levels).expect("Unable to initialize time-based ambient light"),
