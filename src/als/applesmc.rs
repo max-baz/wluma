@@ -13,9 +13,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(800);
 ///
 /// The `applesmc` platform driver exposes the sensor as
 /// `/sys/devices/platform/applesmc.<id>/light`, formatted as `(left,right)`.
-/// Older machines report one 8-bit value per side; newer ones report a single
-/// 10-bit value in the left slot and leave the right slot at zero. The brighter
-/// slot is used as a raw, unitless illuminance reading.
+/// The brighter slot is used as a raw, unitless illuminance reading.
 pub struct Als {
     path: PathBuf,
 }
@@ -60,7 +58,10 @@ async fn discover(platform_devices: &Path) -> Result<PathBuf> {
     let mut entries = fs::read_dir(platform_devices)
         .await
         .with_context(|| format!("Unable to enumerate '{}'", platform_devices.display()))?;
-    while let Some(Ok(entry)) = entries.next().await {
+    while let Some(entry) = entries.next().await {
+        let Ok(entry) = entry else {
+            continue;
+        };
         if !entry
             .file_name()
             .to_string_lossy()
@@ -88,17 +89,19 @@ fn parse(content: &str) -> Result<u64> {
     let mut values = inner.split(',').map(|value| {
         value
             .trim()
-            .parse::<i64>()
+            .parse::<u64>()
             .map_err(|error| anyhow!("Unexpected Apple SMC light value '{value}': {error}"))
     });
     let left = values
         .next()
         .ok_or_else(|| anyhow!("Unexpected Apple SMC light reading '{trimmed}'"))??;
-    let right = values.next().transpose()?.unwrap_or(0);
+    let right = values
+        .next()
+        .ok_or_else(|| anyhow!("Unexpected Apple SMC light reading '{trimmed}'"))??;
     if values.next().is_some() {
         return Err(anyhow!("Unexpected Apple SMC light reading '{trimmed}'"));
     }
-    Ok(left.max(right).max(0) as u64)
+    Ok(left.max(right))
 }
 
 #[cfg(test)]
@@ -121,14 +124,15 @@ mod tests {
         assert_eq!(11, parse("(11,0)\n").unwrap());
         assert_eq!(17, parse("(4,17)").unwrap());
         assert_eq!(0, parse("(0,0)").unwrap());
-        assert_eq!(1023, parse(" ( 1023 , 0 ) ").unwrap());
-        assert_eq!(0, parse("(-3,-1)").unwrap());
+        assert_eq!(255, parse(" ( 255 , 0 ) ").unwrap());
     }
 
     #[test]
     fn rejects_unexpected_readings() {
         assert!(parse("").is_err());
         assert!(parse("11").is_err());
+        assert!(parse("(1)").is_err());
+        assert!(parse("(-3,-1)").is_err());
         assert!(parse("(a,b)").is_err());
         assert!(parse("(1,2,3)").is_err());
     }

@@ -85,7 +85,7 @@ Explicit `[als.external]`, `[als.iio]`, `[als.applesmc]`, `[als.webcam]`, `[als.
 path = "/sys/bus/iio/devices"
 ```
 
-Intel MacBooks expose their ambient light sensor through the `applesmc` platform driver instead of IIO, as `/sys/devices/platform/applesmc.<id>/light` with the format `(left,right)`. Older models report one 8-bit value per side, newer ones a single 10-bit value in the left slot. wluma uses the brighter slot as a raw illuminance reading on the `lux` scale. The `path` is optional; when omitted, the first `applesmc.*` device with a `light` file is used:
+Intel MacBooks expose their ambient light sensor through the `applesmc` platform driver instead of IIO, as `/sys/devices/platform/applesmc.<id>/light`. wluma uses the brighter sensor reading on the `lux` scale. The `path` is optional; when omitted, the first `applesmc.*` device with a `light` file is used:
 
 ```toml
 [als.applesmc]
