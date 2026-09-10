@@ -72,6 +72,10 @@ pub enum Als {
         path: Option<String>,
         thresholds: HashMap<u64, String>,
     },
+    Applesmc {
+        path: Option<String>,
+        thresholds: HashMap<u64, String>,
+    },
     Time {
         levels: HashMap<u64, u64>,
         thresholds: HashMap<u64, String>,
@@ -93,6 +97,7 @@ impl fmt::Debug for Als {
                 .field("scale", scale)
                 .finish(),
             Self::Iio { path, .. } => f.debug_struct("Iio").field("path", path).finish(),
+            Self::Applesmc { path, .. } => f.debug_struct("Applesmc").field("path", path).finish(),
             Self::Time { levels, .. } => f.debug_struct("Time").field("levels", levels).finish(),
             Self::Webcam { video, .. } => f.debug_struct("Webcam").field("video", video).finish(),
             Self::None => write!(f, "None"),
