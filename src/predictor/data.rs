@@ -213,7 +213,7 @@ impl Data {
             }
         };
         let stored = match Self::read_file(path)
-            .and_then(|file| serde_yaml::from_reader::<_, StoredData>(file).map_err(Into::into))
+            .and_then(|file| yaml_serde::from_reader::<_, StoredData>(file).map_err(Into::into))
         {
             Ok(stored) => stored,
             Err(error) => {
@@ -320,7 +320,7 @@ impl Data {
                 .write(true)
                 .truncate(true)
                 .open(&temporary)?;
-            serde_yaml::to_writer(&mut file, saved)?;
+            yaml_serde::to_writer(&mut file, saved)?;
             file.sync_all()?;
             fs::rename(&temporary, path)?;
             if let Some(parent) = path.parent() {
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn migrates_profile_to_bucket_midpoint() {
-        let stored: StoredData = serde_yaml::from_str(
+        let stored: StoredData = yaml_serde::from_str(
             "output_name: panel\nentries:\n  - lux: dark\n    luma: 20\n    brightness: 30\n",
         )
         .unwrap();
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn accepts_numeric_als() {
-        let stored: StoredData = serde_yaml::from_str(
+        let stored: StoredData = yaml_serde::from_str(
             "output_name: panel\nentries:\n  - als: 42\n    luma: 20\n    brightness: 30\n",
         )
         .unwrap();
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn drops_unknown_profiles_as_migrated() {
-        let stored: StoredData = serde_yaml::from_str(
+        let stored: StoredData = yaml_serde::from_str(
             "output_name: panel\nentries:\n  - lux: unknown\n    luma: 20\n    brightness: 30\n",
         )
         .unwrap();
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn keeps_linear_migration_in_native_domain() {
-        let stored: StoredData = serde_yaml::from_str(
+        let stored: StoredData = yaml_serde::from_str(
             "output_name: panel\nentries:\n  - lux: bright\n    luma: 20\n    brightness: 30\n",
         )
         .unwrap();
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn preserves_legacy_entries_across_reloads() {
-        let stored = serde_yaml::from_str(
+        let stored = yaml_serde::from_str(
             "output_name: panel\nentries:\n  - lux: dark\n    luma: 20\n    brightness: 30\n",
         )
         .unwrap();
@@ -493,7 +493,7 @@ mod tests {
         assert!(was_migrated);
         assert_eq!(vec![Entry::new(15, 20, 30)], migrated.entries);
 
-        let stored = serde_yaml::from_str(&serde_yaml::to_string(&migrated).unwrap()).unwrap();
+        let stored = yaml_serde::from_str(&yaml_serde::to_string(&migrated).unwrap()).unwrap();
         let (reloaded, was_migrated) = Data::from_stored(
             "panel",
             Kind::Brightness,
@@ -509,7 +509,7 @@ mod tests {
     fn groups_values_by_kind() {
         let mut data = Data::new_kind("panel", Kind::Temperature, Scale::Linear, &HashMap::new());
         data.entries.push(Entry::new(10, 20, 4500));
-        let yaml = serde_yaml::to_string(&data).unwrap();
+        let yaml = yaml_serde::to_string(&data).unwrap();
         assert!(yaml.contains("brightness: []"));
         assert!(yaml.contains("dim: []"));
         assert!(yaml.contains("temperature:"));
@@ -527,8 +527,8 @@ mod tests {
         let mut update = Data::new_kind("panel", Kind::Dim, Scale::Linear, &thresholds);
         update.entries = vec![Entry::new(20, 30, 50)];
 
-        let yaml = serde_yaml::to_string(&update.merge(&mut groups)).unwrap();
-        let stored: StoredData = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = yaml_serde::to_string(&update.merge(&mut groups)).unwrap();
+        let stored: StoredData = yaml_serde::from_str(&yaml).unwrap();
         let StoredEntries::Grouped(groups) = stored.entries else {
             unreachable!()
         };
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn omits_legacy_field_for_new_data() {
-        let yaml = serde_yaml::to_string(&Data::new_kind(
+        let yaml = yaml_serde::to_string(&Data::new_kind(
             "panel",
             Kind::Brightness,
             Scale::Linear,

@@ -11,9 +11,9 @@ wayland-backend = { version = "~0.3", features = ["dlopen"] }
 wayland-protocols = { version = "~0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "~0.3", features = ["client"] }
 wayland-protocols-plasma = { version = "~0.3", features = ["client"] }
-pipewire = { version = "~0.9", features = ["v0_3_33"] }
+pipewire = { version = "~0.10", features = ["v0_3_33"] }
 serde = { version = "~1.0", features = ["derive"] }
-serde_yaml = "~0.9"
+yaml_serde = "~0.10"
 toml = "~1.1"
 chrono = "~0.4"
 itertools = "~0.15"
