@@ -168,7 +168,11 @@ fn capture(
     let prediction_controller = Rc::clone(&controller);
     let prediction_luma = Rc::clone(&latest_luma);
     let prediction_last_adjustment = Rc::clone(&last_adjustment);
+    let prediction_frames = successful_frames.clone();
     let prediction_timer = mainloop.loop_().add_timer(move |_| {
+        if prediction_frames.load(Ordering::Relaxed) < startup.required_frames {
+            return;
+        }
         let now = Instant::now();
         if super::prediction_due(prediction_last_adjustment.get(), now) {
             if let Some(luma) = prediction_luma.get() {
@@ -304,14 +308,18 @@ fn capture(
                 .vulkan
                 .luma_percent_from_external_fd(&object)
                 .expect("Unable to process PipeWire DMA-BUF with Vulkan");
+            state.latest_luma.set(Some(luma));
+            let frames = processed_frames.fetch_add(1, Ordering::Relaxed) + 1;
+
+            if frames < startup.required_frames {
+                return;
+            }
             if state.discard_stale_inputs_before_first_frame {
                 state.controller.borrow_mut().discard_stale_inputs();
                 state.discard_stale_inputs_before_first_frame = false;
             }
-            state.latest_luma.set(Some(luma));
             state.last_adjustment.set(Some(now));
             smol::block_on(state.controller.borrow_mut().adjust(luma));
-            processed_frames.fetch_add(1, Ordering::Relaxed);
         })
         .register()?;
 

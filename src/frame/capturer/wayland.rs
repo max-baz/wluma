@@ -49,6 +49,7 @@ pub struct Capturer {
     dmabuf_formats: Vec<(u32, Vec<u64>)>,
     failure: Option<anyhow::Error>,
     successful_frames: usize,
+    startup_required_frames: usize,
     latest_luma: Option<u8>,
     last_adjustment: Option<Instant>,
     discard_stale_inputs_before_first_frame: bool,
@@ -104,6 +105,7 @@ impl Capturer {
             dmabuf_formats: Vec::new(),
             failure: None,
             successful_frames: 0,
+            startup_required_frames: 1,
             latest_luma: None,
             last_adjustment: None,
             discard_stale_inputs_before_first_frame: false,
@@ -188,6 +190,7 @@ impl Capturer {
         startup: super::Startup,
     ) -> Result<()> {
         self.vulkan_device = vulkan_device.map(str::to_string);
+        self.startup_required_frames = startup.required_frames;
         self.discard_stale_inputs_before_first_frame =
             startup.discard_stale_inputs_before_first_frame;
         let connection =
@@ -408,16 +411,23 @@ impl Capturer {
     }
 
     fn process_luma(&mut self, luma: u8) {
+        self.latest_luma = Some(luma);
+        self.successful_frames += 1;
+
+        if self.successful_frames < self.startup_required_frames {
+            return;
+        }
         if self.discard_stale_inputs_before_first_frame {
             self.controller.as_mut().unwrap().discard_stale_inputs();
             self.discard_stale_inputs_before_first_frame = false;
         }
-        self.latest_luma = Some(luma);
-        self.successful_frames += 1;
         self.adjust_prediction(luma, Instant::now());
     }
 
     fn process_prediction_tick(&mut self) {
+        if self.successful_frames < self.startup_required_frames {
+            return;
+        }
         let now = Instant::now();
         if super::prediction_due(self.last_adjustment, now) {
             if let Some(luma) = self.latest_luma {
@@ -1221,8 +1231,24 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for Capturer {
 
 #[cfg(test)]
 mod tests {
-    use super::{match_action, output_match, parse_drm_device, MatchAction, OutputMatch};
+    use super::{match_action, output_match, parse_drm_device, Capturer, MatchAction, OutputMatch};
+    use crate::config::WaylandProtocol;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn probation_collects_frames_before_starting_the_predictor() {
+        let mut capturer = Capturer::new(WaylandProtocol::WlrScreencopyUnstableV1);
+        capturer.startup_required_frames = 3;
+
+        capturer.process_luma(10);
+        capturer.process_prediction_tick();
+        capturer.process_luma(20);
+        capturer.process_prediction_tick();
+
+        assert_eq!(capturer.successful_frames, 2);
+        assert_eq!(capturer.latest_luma, Some(20));
+        assert_eq!(capturer.last_adjustment, None);
+    }
 
     #[test]
     fn prediction_runs_at_fixed_interval() {
