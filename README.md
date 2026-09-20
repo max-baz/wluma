@@ -221,6 +221,8 @@ name = "keyboard"
 path = "/sys/class/leds/asus::kbd_backlight"
 ```
 
+Set `enabled = false` on an entry to exclude an automatically discovered keyboard backlight.
+
 ### Algorithm
 
 The default algorithm that `wluma` uses is called `adaptive`, which is when it learns from you as you continue adjusting brightness manually. It will eventually figure out patterns in how you tend to adjust brightness in dark and lit conditions and depending on what is currently being displayed on the screen, and will beging to do it automatically for you.

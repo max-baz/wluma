@@ -260,7 +260,7 @@ fn parse_file_config(file_config: file::Config) -> Result<app::Config> {
             predictor: app::Predictor::Adaptive,
             als_direction: crate::predictor::AlsDirection::Decreasing,
             gamma: false,
-            enabled: true,
+            enabled: k.enabled.unwrap_or(true),
         })
     }));
 
@@ -441,6 +441,7 @@ path = "/sys/class/leds/kbd_backlight"
         match &config.output[0] {
             app::Output::Backlight(output) => {
                 assert_eq!(output.kind, app::BacklightKind::Keyboard);
+                assert!(output.enabled);
                 assert_eq!(
                     output.als_direction,
                     crate::predictor::AlsDirection::Decreasing
@@ -877,6 +878,27 @@ enabled = false
 
         match &config.output[0] {
             app::Output::DdcUtil(output) => assert!(!output.enabled),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_keyboard_can_be_disabled() {
+        let config = parse_config_str(
+            r#"
+[[keyboard]]
+name = "keyboard"
+path = "/sys/class/leds/kbd_backlight"
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::Backlight(output) => {
+                assert_eq!(output.kind, app::BacklightKind::Keyboard);
+                assert!(!output.enabled);
+            }
             _ => unreachable!(),
         }
     }

@@ -114,6 +114,7 @@ pub struct DdcUtilOutput {
 pub struct Keyboard {
     pub name: String,
     pub path: String,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Default)]
