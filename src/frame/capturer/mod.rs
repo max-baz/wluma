@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PORTAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
-const PROBATION_FRAMES: usize = 3;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(100);
 const ALS_ONLY_PREDICTION_INTERVAL: Duration = Duration::from_millis(200);
@@ -53,13 +52,6 @@ impl fmt::Display for Candidate {
 #[derive(Clone, Copy)]
 pub(super) struct Startup {
     deadline: Instant,
-    required_frames: usize,
-    discard_stale_inputs_before_first_frame: bool,
-}
-
-#[derive(Clone, Copy)]
-struct RunPolicy {
-    required_frames: usize,
     discard_stale_inputs_before_first_frame: bool,
 }
 
@@ -71,7 +63,7 @@ enum SelectedMode {
 
 struct Attempt {
     controller: crate::predictor::Controller,
-    frames: usize,
+    established: bool,
     result: Result<()>,
 }
 
@@ -90,14 +82,13 @@ impl Candidate {
         vulkan_device: Option<&str>,
         active: Arc<AtomicBool>,
         status: &crate::control::Hub,
-        policy: RunPolicy,
+        discard_stale_inputs_before_first_frame: bool,
     ) -> Attempt {
         let startup = Startup {
             deadline: Instant::now() + self.startup_timeout(),
-            required_frames: policy.required_frames,
-            discard_stale_inputs_before_first_frame: policy.discard_stale_inputs_before_first_frame,
+            discard_stale_inputs_before_first_frame,
         };
-        let (controller, frames, result) = match self {
+        let (controller, established, result) = match self {
             Self::Wayland(protocol) => {
                 let mut capturer = wayland::Capturer::new(protocol.clone());
                 capturer.run(output, controller, vulkan_device, active, status, startup)
@@ -113,13 +104,13 @@ impl Candidate {
                         output,
                         startup,
                     ),
-                    Err(error) => (controller, 0, Err(error)),
+                    Err(error) => (controller, false, Err(error)),
                 }
             }
         };
         Attempt {
             controller,
-            frames,
+            established,
             result,
         }
     }
@@ -268,10 +259,7 @@ fn select_and_run(
             vulkan_device,
             active.clone(),
             status,
-            RunPolicy {
-                required_frames: PROBATION_FRAMES,
-                discard_stale_inputs_before_first_frame: false,
-            },
+            false,
         );
         controller = attempt.controller;
         if !active.load(Ordering::Relaxed) {
@@ -280,7 +268,7 @@ fn select_and_run(
         match attempt.result {
             Ok(()) => return Ok(()),
             Err(error)
-                if probe_is_established(attempt.frames)
+                if attempt.established
                     || retry_same_candidate_after_setup_failure(&candidate, &error) =>
             {
                 controller.discard_stale_inputs();
@@ -356,10 +344,6 @@ fn pipewire_candidates() -> Vec<Candidate> {
     ]
 }
 
-fn probe_is_established(frames: usize) -> bool {
-    frames >= PROBATION_FRAMES
-}
-
 fn retry_same_candidate_after_setup_failure(candidate: &Candidate, error: &anyhow::Error) -> bool {
     matches!(
         candidate,
@@ -392,10 +376,7 @@ fn run_selected(
             vulkan_device,
             active.clone(),
             status,
-            RunPolicy {
-                required_frames: 1,
-                discard_stale_inputs_before_first_frame: reconnecting,
-            },
+            reconnecting,
         );
         controller = attempt.controller;
         if !active.load(Ordering::Relaxed) {
@@ -406,7 +387,7 @@ fn run_selected(
             Err(error) => {
                 if startup_failure_is_fatal
                     && !reconnecting
-                    && attempt.frames == 0
+                    && !attempt.established
                     && active.load(Ordering::Relaxed)
                 {
                     return Err(error).with_context(|| {
@@ -445,13 +426,6 @@ fn wait_while_active(active: &AtomicBool, duration: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn probe_requires_several_frames() {
-        assert!(!probe_is_established(0));
-        assert!(!probe_is_established(PROBATION_FRAMES - 1));
-        assert!(probe_is_established(PROBATION_FRAMES));
-    }
 
     #[test]
     fn inhibited_mutter_capture_does_not_fall_back_to_portal() {

@@ -10,7 +10,7 @@ use pw::spa::pod::Pod;
 use std::cell::{Cell, RefCell};
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -81,14 +81,14 @@ pub(super) fn run_prepared(
     status: &crate::control::Hub,
     output_name: &str,
     startup: super::Startup,
-) -> (Controller, usize, Result<()>) {
+) -> (Controller, bool, Result<()>) {
     let Prepared { source, protocol } = prepared;
     let controller = Rc::new(RefCell::new(controller));
-    let successful_frames = Arc::new(AtomicUsize::new(0));
+    let established = Arc::new(AtomicBool::new(false));
     let result = capture(
         source,
         Rc::clone(&controller),
-        successful_frames.clone(),
+        established.clone(),
         vulkan_device,
         active,
         startup,
@@ -104,11 +104,7 @@ pub(super) fn run_prepared(
     let controller = Rc::into_inner(controller)
         .expect("PipeWire capture retained the predictor controller")
         .into_inner();
-    (
-        controller,
-        successful_frames.load(Ordering::Relaxed),
-        result,
-    )
+    (controller, established.load(Ordering::Relaxed), result)
 }
 
 fn portal_source(output_name: &str, deadline: Instant, active: &AtomicBool) -> Result<Source> {
@@ -134,7 +130,7 @@ struct Data {
 fn capture(
     source: Source,
     controller: Rc<RefCell<Controller>>,
-    successful_frames: Arc<AtomicUsize>,
+    established: Arc<AtomicBool>,
     vulkan_device: Option<&str>,
     active: Arc<AtomicBool>,
     startup: super::Startup,
@@ -150,11 +146,10 @@ fn capture(
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let timer_loop = mainloop.clone();
     let shutdown_active = active.clone();
-    let validation_frames = successful_frames.clone();
+    let validation_established = established.clone();
     let shutdown_timer = mainloop.loop_().add_timer(move |_| {
-        let validation_timed_out = validation_frames.load(Ordering::Relaxed)
-            < startup.required_frames
-            && Instant::now() >= startup.deadline;
+        let validation_timed_out =
+            !validation_established.load(Ordering::Relaxed) && Instant::now() >= startup.deadline;
         if !shutdown_active.load(Ordering::Relaxed) || validation_timed_out {
             timer_loop.quit();
         }
@@ -168,9 +163,9 @@ fn capture(
     let prediction_controller = Rc::clone(&controller);
     let prediction_luma = Rc::clone(&latest_luma);
     let prediction_last_adjustment = Rc::clone(&last_adjustment);
-    let prediction_frames = successful_frames.clone();
+    let prediction_established = established.clone();
     let prediction_timer = mainloop.loop_().add_timer(move |_| {
-        if prediction_frames.load(Ordering::Relaxed) < startup.required_frames {
+        if !prediction_established.load(Ordering::Relaxed) {
             return;
         }
         let now = Instant::now();
@@ -219,7 +214,7 @@ fn capture(
         discard_stale_inputs_before_first_frame: startup.discard_stale_inputs_before_first_frame,
     };
     let stream_loop = mainloop.clone();
-    let processed_frames = successful_frames.clone();
+    let processed_established = established.clone();
     let _listener = stream
         .add_local_listener_with_user_data(data)
         .state_changed(move |_, _, old, new| match new {
@@ -309,11 +304,7 @@ fn capture(
                 .luma_percent_from_external_fd(&object)
                 .expect("Unable to process PipeWire DMA-BUF with Vulkan");
             state.latest_luma.set(Some(luma));
-            let frames = processed_frames.fetch_add(1, Ordering::Relaxed) + 1;
-
-            if frames < startup.required_frames {
-                return;
-            }
+            processed_established.store(true, Ordering::Relaxed);
             if state.discard_stale_inputs_before_first_frame {
                 state.controller.borrow_mut().discard_stale_inputs();
                 state.discard_stale_inputs_before_first_frame = false;
@@ -403,13 +394,9 @@ fn capture(
     )?;
     on_ready();
     mainloop.run();
-    if active.load(Ordering::Relaxed)
-        && successful_frames.load(Ordering::Relaxed) < startup.required_frames
-    {
+    if active.load(Ordering::Relaxed) && !established.load(Ordering::Relaxed) {
         Err(anyhow!(
-            "PipeWire screen capture produced only {} of {} required startup frames",
-            successful_frames.load(Ordering::Relaxed),
-            startup.required_frames,
+            "PipeWire screen capture did not produce a startup frame"
         ))
     } else if active.load(Ordering::Relaxed) {
         Err(anyhow!("PipeWire screen stream stopped unexpectedly"))
