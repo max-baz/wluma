@@ -171,6 +171,12 @@ impl Controller {
         let started = Instant::now();
         match self.als.get().await {
             Ok(Some(value)) => {
+                if self.last_reading.is_none() {
+                    log::debug!(
+                        "Received first ALS observation: {value} (source: {})",
+                        self.als.kind().await
+                    );
+                }
                 if let Some(status) = &self.status {
                     status.set_als(self.als.kind().await, value);
                 }
@@ -206,6 +212,13 @@ impl Controller {
     }
 
     fn publish(&mut self, reading: Reading) {
+        if self.last_reading.is_none() {
+            log::debug!(
+                "Publishing first ALS reading: {} (stable: {})",
+                reading.value,
+                reading.stable
+            );
+        }
         self.last_reading = Some(reading);
         self.value_txs.retain(|channel| !channel.is_closed());
         for channel in &self.value_txs {

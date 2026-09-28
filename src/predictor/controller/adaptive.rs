@@ -135,11 +135,19 @@ impl Controller {
 
     pub async fn discard_inputs(&mut self) {
         if self.last_als.is_none() {
+            log::debug!(
+                "[{}] Waiting for initial ALS input while discarding inputs",
+                self.output_name
+            );
             self.last_als = Some(
                 self.als_rx
                     .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
                     .await
                     .expect("als_rx closed unexpectedly"),
+            );
+            log::debug!(
+                "[{}] Waiting for initial brightness input while discarding inputs",
+                self.output_name
             );
             self.user_rx
                 .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
@@ -178,6 +186,7 @@ impl Controller {
 
     pub async fn adjust(&mut self, luma: u8) {
         if self.last_als.is_none() {
+            log::debug!("[{}] Waiting for initial ALS input", self.output_name);
             // ALS controller is expected to send the initial value on this channel asap
             self.last_als = Some(
                 self.als_rx
@@ -186,12 +195,17 @@ impl Controller {
                     .expect("als_rx closed unexpectedly"),
             );
 
+            log::debug!(
+                "[{}] Received initial ALS input; waiting for initial brightness input",
+                self.output_name
+            );
             // Brightness controller is expected to send the initial value on this channel asap
             let initial_brightness = self
                 .user_rx
                 .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
                 .await
                 .expect("user_rx closed unexpectedly");
+            log::debug!("[{}] Received initial brightness input", self.output_name);
 
             // If there are no learned entries yet, we will use this as the first data point,
             // assuming that user is happy with the current brightness settings

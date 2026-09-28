@@ -110,14 +110,23 @@ impl Als {
             .is_none_or(|last| now.duration_since(last) >= PROBE_INTERVAL);
         if probe {
             state.last_iio_probe = Some(now);
-            if let Ok(source) = iio::Als::new(Some("/sys/bus/iio/devices")).await {
-                match source.get().await {
+            log::debug!("Probing IIO ambient light sensor");
+            match iio::Als::new(Some("/sys/bus/iio/devices")).await {
+                Ok(source) => match source.get().await {
                     Ok(value) => {
+                        log::debug!(
+                            "IIO ambient light sensor probe succeeded after {:?}",
+                            now.elapsed()
+                        );
                         self.switch(&mut state, Source::Iio(source));
                         return Ok(Some(value));
                     }
                     Err(error) => log::debug!("Unable to read detected IIO sensor: {error:#}"),
-                }
+                },
+                Err(error) => log::debug!(
+                    "IIO ambient light sensor probe failed after {:?}: {error:#}",
+                    now.elapsed()
+                ),
             }
         }
 
