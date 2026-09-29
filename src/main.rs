@@ -131,13 +131,22 @@ async fn main() -> ExitCode {
         config::Als::None => als::Als::None(Default::default()),
     };
 
+    if let als::Als::Auto(als) = &source {
+        als.get()
+            .await
+            .unwrap_or_else(|error| panic!("Ambient light sensing failed: {error:#}"));
+    }
+
     let (registration_tx, registration_rx) = channel::unbounded();
     let als_status = status.clone();
     let als_task = smol::spawn(async move {
-        als::controller::Controller::new(source, registration_rx)
+        if let Err(error) = als::controller::Controller::new(source, registration_rx)
             .with_status(als_status)
             .run()
-            .await;
+            .await
+        {
+            panic!("Ambient light sensing failed: {error:#}");
+        }
     });
 
     let (idle_task, idle_rx) = if let Some(idle_config) = idle_config {

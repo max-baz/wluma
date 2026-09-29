@@ -97,7 +97,7 @@ impl Als {
 
     async fn get_raw(&self) -> Result<u64> {
         match &self.source {
-            Source::SensorProxy(sensor) => Ok(sensor.lock().await.get_raw().await),
+            Source::SensorProxy(sensor) => sensor.lock().await.get_raw().await,
             Source::Sysfs(sensor) => Ok((match sensor.as_ref() {
                 SensorType::Illuminance { channel, .. } => read_channel(channel).await?,
                 SensorType::Rgb {
@@ -111,6 +111,41 @@ impl Als {
             .round() as u64),
         }
     }
+}
+
+pub async fn has_sensor(base_path: &str) -> Result<bool> {
+    let mut devices = match fs::read_dir(base_path).await {
+        Ok(devices) => devices,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = devices.next().await {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("iio:device")
+        {
+            continue;
+        }
+        let mut files = fs::read_dir(entry.path()).await?;
+        let mut names = Vec::new();
+        while let Some(file) = files.next().await {
+            names.push(file?.file_name().to_string_lossy().into_owned());
+        }
+        if CHANNELS.iter().any(|channel| {
+            names.iter().any(|name| {
+                name == &format!("{channel}_input") || name == &format!("{channel}_raw")
+            })
+        }) || ["red", "green", "blue"].iter().all(|color| {
+            names
+                .iter()
+                .any(|name| name == &format!("in_intensity_{color}_raw"))
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn find_sensor(base_path: &str) -> Result<SensorType> {
@@ -289,4 +324,38 @@ async fn read_attribute(path: &Path, name: &str) -> Result<f64> {
 
 async fn open_file(path: &Path, name: &str) -> Result<File> {
     File::open(path.join(name)).await.map_err(Error::msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn detects_sensor_files_without_reading_them() {
+        smol::block_on(async {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("wluma-iio-detection-{unique}"));
+            let device = dir.join("iio:device0");
+            std::fs::create_dir_all(&device).unwrap();
+            let path = dir.to_str().unwrap();
+            assert!(!has_sensor(path).await.unwrap());
+            std::fs::write(device.join("in_illuminance_raw"), "invalid").unwrap();
+            assert!(has_sensor(path).await.unwrap());
+            std::fs::remove_dir_all(dir).unwrap();
+        });
+    }
+
+    #[test]
+    fn missing_sysfs_directory_has_no_sensor() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wluma-missing-iio-{unique}"));
+        assert!(!smol::block_on(has_sensor(path.to_str().unwrap())).unwrap());
+    }
 }

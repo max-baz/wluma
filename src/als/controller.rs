@@ -1,3 +1,4 @@
+use anyhow::Result;
 use smol::channel::{Receiver, Sender};
 use smol::Timer;
 use std::time::{Duration, Instant};
@@ -160,13 +161,13 @@ impl Controller {
         self
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self) -> Result<()> {
         loop {
-            self.step().await;
+            self.step().await?;
         }
     }
 
-    async fn step(&mut self) {
+    async fn step(&mut self) -> Result<()> {
         self.register().await;
         let started = Instant::now();
         match self.als.get().await {
@@ -202,13 +203,22 @@ impl Controller {
                     self.publish(reading);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(reading) = self.last_reading.filter(|reading| reading.stable) {
+                    self.publish(Reading {
+                        value: reading.value,
+                        stable: false,
+                    });
+                }
+            }
+            Err(error) if matches!(self.als, Als::Auto(_)) => return Err(error),
             Err(error) => log::error!("Unable to get ALS value: {error:?}"),
         }
 
         if let Some(remaining) = self.als.poll_interval().checked_sub(started.elapsed()) {
             Timer::after(remaining).await;
         }
+        Ok(())
     }
 
     fn publish(&mut self, reading: Reading) {

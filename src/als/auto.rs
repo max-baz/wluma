@@ -1,5 +1,5 @@
 use super::{applesmc, external, iio};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use smol::lock::Mutex;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
@@ -21,6 +21,7 @@ struct State {
     last_external_probe: Option<Instant>,
     last_iio_probe: Option<Instant>,
     last_applesmc_probe: Option<Instant>,
+    known_sensor: bool,
 }
 
 enum Source {
@@ -40,6 +41,7 @@ impl Als {
                 last_external_probe: None,
                 last_iio_probe: None,
                 last_applesmc_probe: None,
+                known_sensor: false,
             }),
             generation: AtomicU64::new(0),
             poll_interval_ms: AtomicU64::new(super::DEFAULT_POLL_INTERVAL.as_millis() as u64),
@@ -84,12 +86,14 @@ impl Als {
             self.switch(&mut state, Source::None);
         }
 
+        let mut lost_source = false;
         if let Source::Iio(source) = &state.source {
             match source.get().await {
                 Ok(value) => return Ok(Some(value)),
                 Err(error) => {
                     log::info!("IIO ambient light sensor disappeared: {error:#}");
                     self.switch(&mut state, Source::None);
+                    lost_source = true;
                 }
             }
         }
@@ -100,10 +104,15 @@ impl Als {
                 Err(error) => {
                     log::info!("Apple SMC ambient light sensor disappeared: {error:#}");
                     self.switch(&mut state, Source::None);
+                    lost_source = true;
                 }
             }
         }
+        if lost_source {
+            return Ok(None);
+        }
 
+        let mut iio_error = None;
         let now = Instant::now();
         let probe = state
             .last_iio_probe
@@ -118,15 +127,22 @@ impl Als {
                             "IIO ambient light sensor probe succeeded after {:?}",
                             now.elapsed()
                         );
+                        state.known_sensor = true;
                         self.switch(&mut state, Source::Iio(source));
                         return Ok(Some(value));
                     }
-                    Err(error) => log::debug!("Unable to read detected IIO sensor: {error:#}"),
+                    Err(error) => {
+                        log::debug!("Unable to read detected IIO sensor: {error:#}");
+                        iio_error = Some(error);
+                    }
                 },
-                Err(error) => log::debug!(
-                    "IIO ambient light sensor probe failed after {:?}: {error:#}",
-                    now.elapsed()
-                ),
+                Err(error) => {
+                    log::debug!(
+                        "IIO ambient light sensor probe failed after {:?}: {error:#}",
+                        now.elapsed()
+                    );
+                    iio_error = Some(error);
+                }
             }
         }
 
@@ -138,6 +154,7 @@ impl Als {
             match applesmc::Als::new(None).await {
                 Ok(source) => match source.get().await {
                     Ok(value) => {
+                        state.known_sensor = true;
                         self.switch(&mut state, Source::Applesmc(source));
                         return Ok(Some(value));
                     }
@@ -146,6 +163,29 @@ impl Als {
                     }
                 },
                 Err(error) => log::trace!("No Apple SMC ambient light sensor: {error:#}"),
+            }
+        }
+
+        if state.known_sensor {
+            return Ok(None);
+        }
+        if let Some(error) = iio_error {
+            let sysfs_present = iio::has_sensor("/sys/bus/iio/devices").await?;
+            let proxy_present = if sysfs_present {
+                false
+            } else {
+                match smol::unblock(super::sensor_proxy::has_ambient_light).await {
+                    Ok(present) => present,
+                    Err(error) => {
+                        log::debug!("Unable to check iio-sensor-proxy for an ambient light sensor: {error:#}");
+                        false
+                    }
+                }
+            };
+            if sysfs_present || proxy_present {
+                return Err(anyhow!(
+                    "An IIO ambient light sensor was detected, but neither iio-sensor-proxy nor sysfs can read it: {error:#}"
+                ));
             }
         }
 

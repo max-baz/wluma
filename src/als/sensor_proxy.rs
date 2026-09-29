@@ -150,11 +150,11 @@ impl Sensor {
         })
     }
 
-    pub async fn get_raw(&mut self) -> u64 {
-        loop {
+    pub async fn get_raw(&mut self) -> Result<u64> {
+        while self.active.load(Ordering::Relaxed) {
             match self.value_rx.try_recv() {
                 Ok(value) => self.value = value,
-                Err(TryRecvError::Empty) => return self.value,
+                Err(TryRecvError::Empty) => return Ok(self.value),
                 Err(TryRecvError::Closed) => break,
             }
         }
@@ -163,13 +163,14 @@ impl Sensor {
             .reconnect_at
             .is_some_and(|reconnect_at| reconnect_at > Instant::now())
         {
-            return self.value;
+            return Err(anyhow!("Waiting to reconnect to iio-sensor-proxy"));
         }
 
         match smol::unblock(Self::new).await {
             Ok(sensor) => {
                 log::info!("Reconnected to iio-sensor-proxy");
                 *self = sensor;
+                Ok(self.value)
             }
             Err(error) => {
                 if self.reconnect_at.is_none() {
@@ -177,11 +178,19 @@ impl Sensor {
                 }
                 log::debug!("Unable to reconnect to iio-sensor-proxy: {error}");
                 self.reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
+                Err(error)
             }
         }
-
-        self.value
     }
+}
+
+pub fn has_ambient_light() -> Result<bool> {
+    if !service_available()? {
+        return Ok(false);
+    }
+    let connection = Connection::new_system()?;
+    let proxy = connection.with_proxy(DESTINATION, PATH, TIMEOUT);
+    Ok(proxy.get(INTERFACE, "HasAmbientLight")?)
 }
 
 fn service_available() -> Result<bool> {
@@ -217,6 +226,20 @@ fn light_level(value: f64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnected_sensor_does_not_return_stale_light_level() {
+        smol::block_on(async {
+            let (_, value_rx) = channel::bounded(1);
+            let mut sensor = Sensor {
+                value_rx,
+                value: 42,
+                active: Arc::new(AtomicBool::new(false)),
+                reconnect_at: Some(Instant::now() + RECONNECT_INTERVAL),
+            };
+            assert!(sensor.get_raw().await.is_err());
+        });
+    }
 
     #[test]
     fn converts_light_levels() {

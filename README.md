@@ -76,7 +76,7 @@ The configuration is entirely optional, as everything is auto-detected to the be
 
 ### ALS
 
-When ALS configuration is omitted, wluma uses an external ALS whenever `$XDG_RUNTIME_DIR/wluma/als.sock` is a Unix socket, otherwise it uses an available IIO ambient light sensor, then the Apple SMC sensor of an Intel MacBook, or continues without one. This selection is updated while wluma is running as sources appear and disappear. For IIO it first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`.
+When ALS configuration is omitted, wluma uses an external ALS whenever `$XDG_RUNTIME_DIR/wluma/als.sock` is a Unix socket, otherwise it uses an available IIO ambient light sensor, then the Apple SMC sensor of an Intel MacBook, or continues without one. This selection is updated while wluma is running as sources appear and disappear. For IIO it first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`. If an IIO sensor is detected but neither method can read it, wluma exits with an error instead of treating it as absent.
 
 Explicit `[als.external]`, `[als.iio]`, `[als.applesmc]`, `[als.webcam]`, `[als.time]` and `[als.none]` sections override automatic selection. The IIO `path` enables direct polling from a different sysfs directory when `iio-sensor-proxy` is unavailable.
 
