@@ -5,13 +5,21 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: just test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: taiki-e/install-action@just
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@6b65014c06e2adee0cc956076c200ca3432af678
+        with:
+          tool: just@1.58.0
+          fallback: none
       - run: sudo apt-get update
       - run: sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev libpipewire-0.3-dev
       - run: WLUMA_VERSION=0.0.0-ci just test
@@ -20,8 +28,13 @@ jobs:
     name: just lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: taiki-e/install-action@just
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@6b65014c06e2adee0cc956076c200ca3432af678
+        with:
+          tool: just@1.58.0
+          fallback: none
       - run: sudo apt-get update
       - run: sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev libpipewire-0.3-dev
       - run: WLUMA_VERSION=0.0.0-ci just lint
