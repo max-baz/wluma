@@ -6,10 +6,9 @@ use crate::channel_ext::ReceiverExt;
 use super::Brightness;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
-const TRANSITION_MAX_MS: u64 = 200;
+const TRANSITION_DURATION_MS: u64 = 200;
 
 pub struct Controller {
     brightness: Brightness,
@@ -103,7 +102,11 @@ impl Controller {
             self.wait().await;
             return;
         }
-        match self.brightness.get().await {
+        let brightness = match (&self.brightness, self.target, self.current) {
+            (Brightness::DdcUtil(_), Some(_), Some(current)) => Ok(current),
+            _ => self.brightness.get().await,
+        };
+        match brightness {
             Ok(new_brightness) => {
                 let predicted_value = self
                     .prediction_rx
@@ -398,15 +401,18 @@ impl Controller {
         match (&self.target, self.current) {
             (Some(old_target), _) if old_target.desired == desired => (),
             (_, Some(current))
-                if desired.abs_diff(current) < self.brightness.change_threshold() => {}
+                if desired.abs_diff(current) < self.brightness.change_threshold() =>
+            {
+                self.target = None;
+            }
             (_, Some(current)) => {
-                let max_transition_steps = TRANSITION_MAX_MS
+                let transition_steps = TRANSITION_DURATION_MS
                     .div_ceil(self.brightness.transition_step_ms())
                     .max(1);
                 let step = if desired > current {
-                    (desired - current).div_ceil(max_transition_steps) as i64
+                    (desired - current).div_ceil(transition_steps) as i64
                 } else {
-                    -((current - desired).div_ceil(max_transition_steps) as i64)
+                    -((current - desired).div_ceil(transition_steps) as i64)
                 };
                 self.target = Some(Target { desired, step });
             }
@@ -420,7 +426,11 @@ impl Controller {
                 if target.reached(current) {
                     self.target = None;
                 } else {
-                    let new_value = current.saturating_add_signed(target.step);
+                    let started = Instant::now();
+                    let interval = Duration::from_millis(self.brightness.transition_step_ms());
+                    let new_value = current
+                        .saturating_add_signed(target.step)
+                        .clamp(current.min(target.desired), current.max(target.desired));
                     match self.brightness.set(new_value).await {
                         Ok(set_value) => {
                             if set_value == current {
@@ -434,7 +444,7 @@ impl Controller {
                             err
                         ),
                     };
-                    thread::sleep(Duration::from_millis(self.brightness.transition_step_ms()));
+                    Timer::at(started + interval).await;
                 }
             }
             _ => unreachable!("Current and target values cannot be None at this point"),
@@ -554,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_target_ignore_when_desired_equals_current() {
+    fn test_update_target_cancels_when_desired_equals_current() {
         let old_target = Some(target(10, -20));
         let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
         controller.target = old_target;
@@ -562,7 +572,7 @@ mod tests {
 
         controller.update_target(7);
 
-        assert_eq!(old_target, controller.target);
+        assert_eq!(None, controller.target);
     }
 
     #[test]
@@ -576,6 +586,7 @@ mod tests {
         };
         let mut controller = Controller::new(brightness, user_tx, prediction_rx);
         controller.current = Some(10000);
+        controller.target = Some(target(11000, 5));
 
         controller.update_target(10019);
 
@@ -587,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_target_finds_minimal_step_that_reaches_target_within_transition_duration() {
+    fn test_update_target_finds_minimal_step_for_nominal_transition_duration() {
         let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
 
         let test_cases = vec![
@@ -646,6 +657,55 @@ mod tests {
 
         assert_eq!(Some(9), controller.current);
         assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn test_transition_keeps_fixed_steps_after_delay() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![12, 14]));
+        controller.current = Some(10);
+        controller.target = Some(target(20, 2));
+
+        controller.transition().await;
+        Timer::after(Duration::from_millis(5)).await;
+        controller.transition().await;
+
+        assert_eq!(Some(14), controller.current);
+        assert_eq!(Some(target(20, 2)), controller.target);
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn test_transition_clamps_to_target_in_both_directions() {
+        for (current, desired, step) in [(59, 70, 13), (33, 20, -14)] {
+            let (mut controller, _, _) = setup(brightness_mock(vec![], vec![desired]));
+            controller.current = Some(current);
+            controller.target = Some(target(desired, step));
+
+            controller.transition().await;
+
+            assert_eq!(Some(desired), controller.current);
+            assert!(is_brightness_spent(&controller.brightness));
+
+            controller.transition().await;
+
+            assert_eq!(None, controller.target);
+        }
+    }
+
+    #[apply(test!)]
+    async fn test_step_cancels_obsolete_transition() -> Result<()> {
+        let (mut controller, prediction_tx, user_rx) = setup(brightness_mock(vec![50], vec![]));
+        controller.current = Some(50);
+        controller.target = Some(target(70, 2));
+        prediction_tx.send(50).await?;
+
+        controller.step().await;
+
+        assert_eq!(Some(50), controller.current);
+        assert_eq!(None, controller.target);
+        assert!(user_rx.is_empty());
+        assert!(is_brightness_spent(&controller.brightness));
+        Ok(())
     }
 
     #[apply(test!)]

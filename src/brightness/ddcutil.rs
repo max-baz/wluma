@@ -25,7 +25,7 @@ struct Service {
 }
 
 pub struct DdcUtil {
-    backend: Backend,
+    backend: Option<Backend>,
     min_brightness: u64,
     max_brightness: u64,
 }
@@ -36,7 +36,7 @@ impl DdcUtil {
             Ok((service, max_brightness)) => {
                 log::info!("Using ddcutil-service over D-Bus for DDC display '{identifier}'");
                 Ok(Self {
-                    backend: Backend::Service(service),
+                    backend: Some(Backend::Service(service)),
                     min_brightness,
                     max_brightness: (max_brightness as u64).max(min_brightness),
                 })
@@ -56,7 +56,7 @@ impl DdcUtil {
                     "Using raw DDC for display '{identifier}' (using ddcutil-service is recommended)"
                 );
                 Ok(Self {
-                    backend: Backend::Raw(display),
+                    backend: Some(Backend::Raw(display)),
                     min_brightness,
                     max_brightness: max_brightness.max(min_brightness),
                 })
@@ -64,31 +64,43 @@ impl DdcUtil {
         }
     }
 
+    async fn with_backend<T: Send + 'static>(
+        &mut self,
+        operation: impl FnOnce(&mut Backend) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let mut backend = self.backend.take().expect("DDC backend is available");
+        let (result, backend) = smol::unblock(move || (operation(&mut backend), backend)).await;
+        self.backend = Some(backend);
+        result
+    }
+
     pub async fn get(&mut self) -> Result<u64> {
-        let value = match &mut self.backend {
-            Backend::Service(service) => {
-                let (current, maximum) = service.get_brightness()?;
-                self.max_brightness = (maximum as u64).max(self.min_brightness);
-                current as u64
-            }
-            Backend::Raw(display) => display
-                .handle
-                .get_vcp_feature(DDC_BRIGHTNESS_FEATURE)
-                .context("Unable to read brightness over raw DDC")?
-                .value() as u64,
-        };
-        Ok(value.clamp(self.min_brightness, self.max_brightness))
+        let (value, maximum) = self
+            .with_backend(|backend| match backend {
+                Backend::Service(service) => service.get_brightness(),
+                Backend::Raw(display) => {
+                    let reply = display
+                        .handle
+                        .get_vcp_feature(DDC_BRIGHTNESS_FEATURE)
+                        .context("Unable to read brightness over raw DDC")?;
+                    Ok((reply.value(), reply.maximum()))
+                }
+            })
+            .await?;
+        self.max_brightness = (maximum as u64).max(self.min_brightness);
+        Ok((value as u64).clamp(self.min_brightness, self.max_brightness))
     }
 
     pub async fn set(&mut self, value: u64) -> Result<u64> {
         let value = value.clamp(self.min_brightness, self.max_brightness);
-        match &mut self.backend {
-            Backend::Service(service) => service.set_brightness(value as u16)?,
+        self.with_backend(move |backend| match backend {
+            Backend::Service(service) => service.set_brightness(value as u16),
             Backend::Raw(display) => display
                 .handle
                 .set_vcp_feature(DDC_BRIGHTNESS_FEATURE, value as u16)
-                .context("Unable to set brightness over raw DDC")?,
-        }
+                .context("Unable to set brightness over raw DDC"),
+        })
+        .await?;
         Ok(value)
     }
 
