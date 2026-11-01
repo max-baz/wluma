@@ -96,6 +96,7 @@ pub struct BacklightOutput {
     pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
     pub gamma: Option<bool>,
+    pub transition_ms: Option<u64>,
     pub enabled: Option<bool>,
 }
 
@@ -107,6 +108,7 @@ pub struct DdcUtilOutput {
     pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
     pub gamma: Option<bool>,
+    pub transition_ms: Option<u64>,
     pub enabled: Option<bool>,
 }
 

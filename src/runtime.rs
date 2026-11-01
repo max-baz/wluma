@@ -536,6 +536,10 @@ impl Session {
             }
         };
 
+        let transition_ms = match &output {
+            config::Output::Backlight(output) => output.transition_ms,
+            config::Output::DdcUtil(output) => output.transition_ms,
+        };
         let keyboard = is_keyboard(&output);
         let kind = match &output {
             config::Output::Backlight(_) if keyboard => "keyboard",
@@ -553,7 +557,12 @@ impl Session {
         let brightness_name = name.clone();
         let brightness_paused = paused.clone();
         let brightness = smol::spawn(async move {
-            brightness::Controller::new(backend, user_tx, prediction_rx)
+            let controller = brightness::Controller::new(backend, user_tx, prediction_rx);
+            let controller = match transition_ms {
+                Some(transition_ms) => controller.with_transition_ms(transition_ms),
+                None => controller,
+            };
+            controller
                 .with_control(
                     command_rx,
                     brightness_status,
@@ -842,6 +851,7 @@ mod tests {
                 min_brightness: 1,
                 predictor: config::Predictor::Adaptive,
                 gamma: false,
+                transition_ms: None,
                 enabled: true,
             })
         } else {
@@ -855,6 +865,7 @@ mod tests {
                 predictor: config::Predictor::Adaptive,
                 als_direction: predictor::AlsDirection::Increasing,
                 gamma: false,
+                transition_ms: None,
                 enabled: true,
             })
         };
