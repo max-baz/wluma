@@ -420,7 +420,14 @@ impl Controller {
                 if target.reached(current) {
                     self.target = None;
                 } else {
+                    // The step is rounded up, so the last one can be larger than
+                    // what is left. Stop at the target instead of passing it.
                     let new_value = current.saturating_add_signed(target.step);
+                    let new_value = if target.step > 0 {
+                        new_value.min(target.desired)
+                    } else {
+                        new_value.max(target.desired)
+                    };
                     match self.brightness.set(new_value).await {
                         Ok(set_value) => {
                             if set_value == current {
@@ -657,6 +664,30 @@ mod tests {
         controller.transition().await;
 
         assert_eq!(Some(0), controller.current);
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn test_transition_last_step_stops_at_target_when_increasing() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![13]));
+        controller.current = Some(12);
+        controller.target = Some(target(13, 4));
+
+        controller.transition().await;
+
+        assert_eq!(Some(13), controller.current);
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn test_transition_last_step_stops_at_target_when_decreasing() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![50]));
+        controller.current = Some(52);
+        controller.target = Some(target(50, -4));
+
+        controller.transition().await;
+
+        assert_eq!(Some(50), controller.current);
         assert!(is_brightness_spent(&controller.brightness));
     }
 
