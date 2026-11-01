@@ -223,6 +223,7 @@ fn parse_file_config(file_config: file::Config) -> Result<app::Config> {
                 predictor: match_predictor(o.predictor.unwrap_or_default())?,
                 als_direction: crate::predictor::AlsDirection::Increasing,
                 gamma: o.gamma.unwrap_or(true),
+                transition_ms: o.transition_ms,
                 enabled: o.enabled.unwrap_or(true),
             }))
         })
@@ -244,6 +245,7 @@ fn parse_file_config(file_config: file::Config) -> Result<app::Config> {
                     vulkan_device: o.vulkan_device.into(),
                     predictor: match_predictor(o.predictor.unwrap_or_default())?,
                     gamma: o.gamma.unwrap_or(true),
+                    transition_ms: o.transition_ms,
                     enabled: o.enabled.unwrap_or(true),
                 }))
             })
@@ -260,6 +262,7 @@ fn parse_file_config(file_config: file::Config) -> Result<app::Config> {
             predictor: app::Predictor::Adaptive,
             als_direction: crate::predictor::AlsDirection::Decreasing,
             gamma: false,
+            transition_ms: None,
             enabled: k.enabled.unwrap_or(true),
         })
     }));
@@ -925,6 +928,40 @@ name = "DP-1"
         }
         match &config.output[1] {
             app::Output::DdcUtil(output) => assert!(output.gamma),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_transition_can_be_set_per_output() {
+        let config = parse_config_str(
+            r#"
+[als.none]
+
+[[output.backlight]]
+name = "panel"
+transition_ms = 500
+
+[[output.ddcutil]]
+name = "DP-1"
+transition_ms = 1500
+
+[[output.ddcutil]]
+name = "DP-2"
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::Backlight(output) => assert_eq!(output.transition_ms, Some(500)),
+            _ => unreachable!(),
+        }
+        match &config.output[1] {
+            app::Output::DdcUtil(output) => assert_eq!(output.transition_ms, Some(1500)),
+            _ => unreachable!(),
+        }
+        match &config.output[2] {
+            app::Output::DdcUtil(output) => assert_eq!(output.transition_ms, None),
             _ => unreachable!(),
         }
     }

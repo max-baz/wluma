@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TRANSITION_MAX_MS: u64 = 200;
+const DEFAULT_TRANSITION_MS: u64 = 200;
+// A longer gap between two transition steps is an interruption, not step time.
+const MAX_MEASURED_STEP_MS: u64 = 5000;
 
 pub struct Controller {
     brightness: Brightness,
@@ -24,6 +26,10 @@ pub struct Controller {
     idle: Option<u8>,
     paused: Option<Arc<AtomicBool>>,
     resuming: bool,
+    transition_ms: Option<u64>,
+    // Measured time per transition step on this display, once there is one.
+    step_ms: Option<u64>,
+    last_step: Option<Instant>,
 }
 
 pub struct Command {
@@ -45,6 +51,7 @@ pub enum CommandAction {
 struct Target {
     desired: u64,
     step: i64,
+    deadline: Option<Instant>,
 }
 
 impl Target {
@@ -68,7 +75,17 @@ impl Controller {
             idle: None,
             paused: None,
             resuming: false,
+            transition_ms: None,
+            step_ms: None,
+            last_step: None,
         }
+    }
+
+    /// Finish each brightness change in about `transition_ms`, measured in real
+    /// time on this display, instead of the default number of steps.
+    pub fn with_transition_ms(mut self, transition_ms: u64) -> Self {
+        self.transition_ms = Some(transition_ms);
+        self
     }
 
     pub fn with_control(
@@ -400,27 +417,88 @@ impl Controller {
             (_, Some(current))
                 if desired.abs_diff(current) < self.brightness.change_threshold() => {}
             (_, Some(current)) => {
-                let max_transition_steps = TRANSITION_MAX_MS
-                    .div_ceil(self.brightness.transition_step_ms())
-                    .max(1);
-                let step = if desired > current {
-                    (desired - current).div_ceil(max_transition_steps) as i64
-                } else {
-                    -((current - desired).div_ceil(max_transition_steps) as i64)
-                };
-                self.target = Some(Target { desired, step });
+                // Whatever ended the last transition (it finished, or a manual
+                // change, pause or idle cut it short), the time since its last
+                // step is not step time.
+                if self.target.is_none() {
+                    self.last_step = None;
+                }
+                let deadline = self
+                    .transition_ms
+                    .map(|ms| Instant::now() + Duration::from_millis(ms));
+                let step = self.step_towards(current, desired, deadline);
+                self.target = Some(Target {
+                    desired,
+                    step,
+                    deadline,
+                });
             }
             _ => unreachable!("Current value cannot be None at this point"),
         };
     }
 
+    // By default a change takes as many steps as fit in 200 ms of the device's
+    // step interval, however long the device then takes for each. With a
+    // deadline it takes as many as fit in the time left at the step time
+    // measured on this device, so a slow display takes bigger steps rather than
+    // more time.
+    fn step_towards(&self, current: u64, desired: u64, deadline: Option<Instant>) -> i64 {
+        let steps = match deadline {
+            Some(deadline) => (deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64)
+                .div_ceil(
+                    self.step_ms
+                        .unwrap_or_else(|| self.brightness.transition_step_ms())
+                        .max(1),
+                ),
+            None => DEFAULT_TRANSITION_MS.div_ceil(self.brightness.transition_step_ms()),
+        }
+        .max(1);
+        let step = desired.abs_diff(current).div_ceil(steps) as i64;
+        if desired > current {
+            step
+        } else {
+            -step
+        }
+    }
+
+    fn measure_step(&mut self, now: Instant) {
+        if let Some(last) = self.last_step {
+            let elapsed = now.saturating_duration_since(last).as_millis() as u64;
+            if elapsed <= MAX_MEASURED_STEP_MS {
+                self.step_ms = Some(match self.step_ms {
+                    Some(previous) => smoothed_step_ms(previous, elapsed),
+                    None => elapsed,
+                });
+            }
+        }
+        self.last_step = Some(now);
+    }
+
     async fn transition(&mut self) {
         match (&self.target, self.current) {
             (Some(target), Some(current)) => {
+                let target = *target;
+                // Measure on the call that finds the target reached too: a
+                // change made in one step has no other sample.
+                self.measure_step(Instant::now());
                 if target.reached(current) {
                     self.target = None;
+                    self.last_step = None;
                 } else {
-                    let new_value = current.saturating_add_signed(target.step);
+                    let step = match target.deadline {
+                        Some(_) => self.step_towards(current, target.desired, target.deadline),
+                        None => target.step,
+                    };
+                    // The step is rounded up, so the last one can be larger than
+                    // what is left. Stop at the target instead of passing it.
+                    let new_value = current.saturating_add_signed(step);
+                    let new_value = if step > 0 {
+                        new_value.min(target.desired)
+                    } else {
+                        new_value.max(target.desired)
+                    };
                     match self.brightness.set(new_value).await {
                         Ok(set_value) => {
                             if set_value == current {
@@ -442,6 +520,10 @@ impl Controller {
     }
 }
 
+fn smoothed_step_ms(previous: u64, measured: u64) -> u64 {
+    (previous + measured).div_ceil(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,7 +534,11 @@ mod tests {
 
     // Intentionally not in main code to prevent confusing fields by accident
     fn target(desired: u64, step: i64) -> Target {
-        Target { desired, step }
+        Target {
+            desired,
+            step,
+            deadline: None,
+        }
     }
 
     fn brightness_mock(get: Vec<u64>, set: Vec<u64>) -> Brightness {
@@ -613,6 +699,115 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_update_target_sizes_steps_to_finish_within_transition() {
+        let (controller, _, _) = setup(brightness_mock(vec![], vec![]));
+        let mut controller = controller.with_transition_ms(4000);
+        controller.step_ms = Some(800);
+        controller.current = Some(49);
+
+        controller.update_target(18);
+
+        // 4000 ms at 800 ms per step is 5 steps for 31.
+        let target = controller.target.unwrap();
+        assert_eq!((18, -7), (target.desired, target.step));
+        assert!(target.deadline.is_some());
+    }
+
+    #[apply(test!)]
+    async fn test_transition_resizes_step_to_the_time_left() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![15]));
+        controller.step_ms = Some(500);
+        controller.current = Some(10);
+        controller.target = Some(Target {
+            desired: 20,
+            step: 1,
+            deadline: Some(Instant::now() + Duration::from_millis(1000)),
+        });
+
+        controller.transition().await;
+
+        assert_eq!(Some(15), controller.current);
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn test_transition_past_its_deadline_finishes() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![20]));
+        controller.current = Some(10);
+        controller.target = Some(Target {
+            desired: 20,
+            step: 1,
+            deadline: Some(Instant::now()),
+        });
+
+        controller.transition().await;
+
+        assert_eq!(Some(20), controller.current);
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[test]
+    fn test_first_step_measurement_replaces_the_nominal_step_time() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
+        let start = Instant::now();
+        controller.last_step = Some(start);
+
+        controller.measure_step(start + Duration::from_millis(850));
+        assert_eq!(Some(850), controller.step_ms);
+
+        controller.measure_step(start + Duration::from_millis(1600));
+        assert_eq!(Some(800), controller.step_ms);
+    }
+
+    #[test]
+    fn test_gaps_longer_than_a_step_are_not_measured() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
+        controller.step_ms = Some(800);
+        let start = Instant::now();
+
+        controller.last_step = Some(start);
+        controller.measure_step(start + Duration::from_millis(MAX_MEASURED_STEP_MS + 1));
+        assert_eq!(Some(800), controller.step_ms);
+
+        controller.last_step = Some(start);
+        controller.measure_step(start + Duration::from_millis(MAX_MEASURED_STEP_MS));
+        assert_eq!(Some(2900), controller.step_ms);
+    }
+
+    #[apply(test!)]
+    async fn test_single_step_transitions_still_measure_their_step() {
+        // A slow outlier pushed the estimate past the whole transition time,
+        // so every change is one step. Reaching the target must still take a
+        // sample, or the estimate could never come back down.
+        let (controller, _, _) = setup(brightness_mock(vec![], vec![]));
+        let mut controller = controller.with_transition_ms(1000);
+        controller.step_ms = Some(1150);
+        controller.current = Some(20);
+        controller.target = Some(target(20, -30));
+        controller.last_step = Instant::now().checked_sub(Duration::from_millis(300));
+
+        controller.transition().await;
+
+        assert_eq!(None, controller.target);
+        assert!(controller.step_ms.unwrap() < 1150);
+        assert_eq!(None, controller.last_step);
+    }
+
+    #[test]
+    fn test_new_transition_does_not_measure_the_gap_before_it() {
+        let (controller, _, _) = setup(brightness_mock(vec![], vec![]));
+        let mut controller = controller.with_transition_ms(3000);
+        controller.step_ms = Some(800);
+        controller.current = Some(60);
+        // A transition that a manual change cut short three seconds ago.
+        controller.last_step = Instant::now().checked_sub(Duration::from_secs(3));
+
+        controller.update_target(29);
+
+        assert_eq!(None, controller.last_step);
+    }
+
     #[apply(test!)]
     async fn test_transition_reset_target_when_reached() {
         let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
@@ -657,6 +852,30 @@ mod tests {
         controller.transition().await;
 
         assert_eq!(Some(0), controller.current);
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn test_transition_last_step_stops_at_target_when_increasing() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![13]));
+        controller.current = Some(12);
+        controller.target = Some(target(13, 4));
+
+        controller.transition().await;
+
+        assert_eq!(Some(13), controller.current);
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn test_transition_last_step_stops_at_target_when_decreasing() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![50]));
+        controller.current = Some(52);
+        controller.target = Some(target(50, -4));
+
+        controller.transition().await;
+
+        assert_eq!(Some(50), controller.current);
         assert!(is_brightness_spent(&controller.brightness));
     }
 

@@ -68,6 +68,7 @@ pub fn outputs() -> Vec<app::Output> {
                 predictor: app::Predictor::Adaptive,
                 als_direction: crate::predictor::AlsDirection::Increasing,
                 gamma: true,
+                transition_ms: None,
                 enabled: true,
             }));
             continue;
@@ -104,6 +105,7 @@ pub fn outputs() -> Vec<app::Output> {
                         min_brightness: 1,
                         predictor: app::Predictor::Adaptive,
                         gamma: true,
+                        transition_ms: None,
                         enabled: true,
                     }));
                     continue;
@@ -147,6 +149,7 @@ fn keyboards() -> Vec<app::Output> {
                 predictor: app::Predictor::Adaptive,
                 als_direction: crate::predictor::AlsDirection::Decreasing,
                 gamma: false,
+                transition_ms: None,
                 enabled: true,
             }))
         })
@@ -385,6 +388,7 @@ fn apply_overrides(detected: &mut app::Output, configured: app::Output) {
             detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
             detected.gamma = configured.gamma;
+            detected.transition_ms = configured.transition_ms;
         }
         (app::Output::DdcUtil(detected), app::Output::DdcUtil(configured)) => {
             detected.name = configured.name;
@@ -396,18 +400,21 @@ fn apply_overrides(detected: &mut app::Output, configured: app::Output) {
             detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
             detected.gamma = configured.gamma;
+            detected.transition_ms = configured.transition_ms;
         }
         (app::Output::Backlight(detected), app::Output::DdcUtil(configured)) => {
             detected.capturer = configured.capturer;
             detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
             detected.gamma = configured.gamma;
+            detected.transition_ms = configured.transition_ms;
         }
         (app::Output::DdcUtil(detected), app::Output::Backlight(configured)) => {
             detected.capturer = configured.capturer;
             detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
             detected.gamma = configured.gamma;
+            detected.transition_ms = configured.transition_ms;
         }
     }
 }
@@ -448,6 +455,7 @@ mod tests {
             predictor: app::Predictor::Adaptive,
             als_direction: crate::predictor::AlsDirection::Increasing,
             gamma: true,
+            transition_ms: None,
             enabled: true,
         })
     }
@@ -599,6 +607,7 @@ mod tests {
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
             gamma: false,
+            transition_ms: None,
             enabled: true,
         });
         let detected = app::Output::DdcUtil(app::DdcUtilOutput {
@@ -610,6 +619,7 @@ mod tests {
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
             gamma: true,
+            transition_ms: None,
             enabled: true,
         });
 
@@ -619,6 +629,39 @@ mod tests {
                 assert!(matches!(output.capturer, app::Capturer::None));
                 assert!(!output.gamma);
             }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn applies_configured_transition_to_detected_output() {
+        let configured = app::Output::DdcUtil(app::DdcUtilOutput {
+            name: "DP-1".to_string(),
+            identifier: "DP-1".to_string(),
+            identifier_overridden: false,
+            capturer: app::Capturer::Auto,
+            vulkan_device: app::VulkanDevice::Auto,
+            min_brightness: 1,
+            predictor: app::Predictor::Adaptive,
+            gamma: true,
+            transition_ms: Some(1500),
+            enabled: true,
+        });
+        let detected = app::Output::DdcUtil(app::DdcUtilOutput {
+            name: "DP-1".to_string(),
+            identifier: "serial-123".to_string(),
+            identifier_overridden: false,
+            capturer: app::Capturer::Auto,
+            vulkan_device: app::VulkanDevice::Auto,
+            min_brightness: 1,
+            predictor: app::Predictor::Adaptive,
+            gamma: true,
+            transition_ms: None,
+            enabled: true,
+        });
+
+        match &merge(vec![configured], vec![detected])[0] {
+            app::Output::DdcUtil(output) => assert_eq!(output.transition_ms, Some(1500)),
             _ => unreachable!(),
         }
     }
