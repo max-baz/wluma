@@ -17,6 +17,11 @@ type DetectedDisplay = (i32, i32, i32, String, String, String, u16, String, u32)
 enum Backend {
     Service(Service),
     Raw(Display),
+    #[cfg(test)]
+    Mock {
+        current: u16,
+        maximum: u16,
+    },
 }
 
 struct Service {
@@ -64,6 +69,15 @@ impl DdcUtil {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn mock(current: u16, maximum: u16) -> Self {
+        Self {
+            backend: Some(Backend::Mock { current, maximum }),
+            min_brightness: 0,
+            max_brightness: maximum as u64,
+        }
+    }
+
     async fn with_backend<T: Send + 'static>(
         &mut self,
         operation: impl FnOnce(&mut Backend) -> Result<T> + Send + 'static,
@@ -85,6 +99,8 @@ impl DdcUtil {
                         .context("Unable to read brightness over raw DDC")?;
                     Ok((reply.value(), reply.maximum()))
                 }
+                #[cfg(test)]
+                Backend::Mock { current, maximum } => Ok((*current, *maximum)),
             })
             .await?;
         self.max_brightness = (maximum as u64).max(self.min_brightness);
@@ -99,6 +115,11 @@ impl DdcUtil {
                 .handle
                 .set_vcp_feature(DDC_BRIGHTNESS_FEATURE, value as u16)
                 .context("Unable to set brightness over raw DDC"),
+            #[cfg(test)]
+            Backend::Mock { current, .. } => {
+                *current = value as u16;
+                Ok(())
+            }
         })
         .await?;
         Ok(value)
@@ -260,6 +281,54 @@ fn binary_serial_identifiers(value: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use macro_rules_attribute::apply;
+    use smol_macros::test;
+    use std::time::Duration;
+
+    #[apply(test!)]
+    async fn blocking_operation_leaves_executor_responsive() -> Result<()> {
+        let mut ddc = DdcUtil::mock(42, 100);
+        let (started_tx, started_rx) = smol::channel::bounded(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut operation = Box::pin(ddc.with_backend(move |_| {
+            started_tx.try_send(())?;
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("Blocking operation was not released")?;
+            Ok(42)
+        }));
+
+        assert!(smol::future::poll_once(operation.as_mut()).await.is_none());
+        smol::future::race(
+            async { started_rx.recv().await.context("Operation did not start") },
+            async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                Err(anyhow!("Timed out waiting for blocking operation"))
+            },
+        )
+        .await?;
+        assert!(smol::future::poll_once(operation.as_mut()).await.is_none());
+        release_tx.send(())?;
+        assert_eq!(42, operation.await?);
+        assert_eq!(42, ddc.get().await?);
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn backend_is_restored_after_operation_error() -> Result<()> {
+        let mut ddc = DdcUtil::mock(42, 100);
+
+        let result = ddc
+            .with_backend(|_| Err::<(), _>(anyhow!("Operation failed")))
+            .await;
+
+        assert_eq!("Operation failed", result.unwrap_err().to_string());
+        assert!(ddc.backend.is_some());
+        assert_eq!(42, ddc.get().await?);
+        assert_eq!(60, ddc.set(60).await?);
+        assert_eq!(60, ddc.get().await?);
+        Ok(())
+    }
 
     #[test]
     fn matches_service_display_identifiers() {

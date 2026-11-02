@@ -102,11 +102,7 @@ impl Controller {
             self.wait().await;
             return;
         }
-        let brightness = match (&self.brightness, self.target, self.current) {
-            (Brightness::DdcUtil(_), Some(_), Some(current)) => Ok(current),
-            _ => self.brightness.get().await,
-        };
-        match brightness {
+        match self.brightness.get().await {
             Ok(new_brightness) => {
                 let predicted_value = self
                     .prediction_rx
@@ -470,6 +466,8 @@ mod tests {
             get,
             set,
             change_threshold: 1,
+            transition_step_ms: 1,
+            set_gate: None,
         }
     }
 
@@ -551,6 +549,26 @@ mod tests {
         Ok(())
     }
 
+    #[apply(test!)]
+    async fn test_step_ddc_manual_change_overrides_transition_and_prediction() -> Result<()> {
+        let brightness = Brightness::DdcUtil(super::super::DdcUtil::mock(42, 100));
+        let (mut controller, prediction_tx, user_rx) = setup(brightness);
+        controller.current = Some(66);
+        controller.target = Some(target(77, 3));
+        prediction_tx.send(37).await?;
+
+        controller.step().await;
+
+        assert_eq!(Some(42), controller.current);
+        assert_eq!(Some(42), controller.prediction);
+        assert_eq!(None, controller.target);
+        assert_eq!(42, user_rx.try_recv()?);
+        assert!(user_rx.is_empty());
+        assert!(controller.prediction_rx.is_empty());
+        assert_eq!(42, controller.brightness.get().await?);
+        Ok(())
+    }
+
     #[test]
     fn test_update_target_ignore_when_desired_didnt_change() {
         let old_target = Some(target(10, -20));
@@ -583,6 +601,8 @@ mod tests {
             get: vec![],
             set: vec![],
             change_threshold: 20,
+            transition_step_ms: 1,
+            set_gate: None,
         };
         let mut controller = Controller::new(brightness, user_tx, prediction_rx);
         controller.current = Some(10000);
@@ -660,18 +680,57 @@ mod tests {
     }
 
     #[apply(test!)]
-    async fn test_transition_keeps_fixed_steps_after_delay() {
-        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![12, 14]));
+    async fn test_transition_yields_during_interval() {
+        let mut brightness = brightness_mock(vec![], vec![12]);
+        if let Brightness::Mock {
+            transition_step_ms, ..
+        } = &mut brightness
+        {
+            *transition_step_ms = 1000;
+        }
+        let (mut controller, _, _) = setup(brightness);
         controller.current = Some(10);
         controller.target = Some(target(20, 2));
 
-        controller.transition().await;
-        Timer::after(Duration::from_millis(5)).await;
-        controller.transition().await;
+        let mut transition = Box::pin(controller.transition());
+        assert!(smol::future::poll_once(transition.as_mut()).await.is_none());
+        drop(transition);
 
+        assert_eq!(Some(12), controller.current);
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn test_slow_write_uses_original_deadline_and_fixed_step() -> Result<()> {
+        let (release_tx, release_rx) = channel::bounded(1);
+        let mut brightness = brightness_mock(vec![], vec![12, 14]);
+        if let Brightness::Mock {
+            transition_step_ms,
+            set_gate,
+            ..
+        } = &mut brightness
+        {
+            *transition_step_ms = 50;
+            *set_gate = Some(release_rx);
+        }
+        let (mut controller, _, _) = setup(brightness);
+        controller.current = Some(10);
+        controller.target = Some(target(20, 2));
+
+        let mut transition = Box::pin(controller.transition());
+        assert!(smol::future::poll_once(transition.as_mut()).await.is_none());
+        Timer::after(Duration::from_millis(100)).await;
+        release_tx.try_send(())?;
+        assert!(smol::future::poll_once(transition.as_mut()).await.is_some());
+        drop(transition);
+
+        assert_eq!(Some(12), controller.current);
+        assert_eq!(Some(target(20, 2)), controller.target);
+        controller.transition().await;
         assert_eq!(Some(14), controller.current);
         assert_eq!(Some(target(20, 2)), controller.target);
         assert!(is_brightness_spent(&controller.brightness));
+        Ok(())
     }
 
     #[apply(test!)]

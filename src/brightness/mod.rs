@@ -17,6 +17,8 @@ pub enum Brightness {
         get: Vec<u64>,
         set: Vec<u64>,
         change_threshold: u64,
+        transition_step_ms: u64,
+        set_gate: Option<smol::channel::Receiver<()>>,
     },
 }
 
@@ -37,7 +39,10 @@ impl Brightness {
             Brightness::Backlight(b) => b.set(value).await,
 
             #[cfg(test)]
-            Brightness::Mock { set, .. } => {
+            Brightness::Mock { set, set_gate, .. } => {
+                if let Some(gate) = set_gate.take() {
+                    gate.recv().await?;
+                }
                 assert_eq!(set.remove(0), value);
                 Ok(value)
             }
@@ -88,7 +93,9 @@ impl Brightness {
             Brightness::Backlight(b) => b.transition_step_ms(),
 
             #[cfg(test)]
-            Brightness::Mock { .. } => 1,
+            Brightness::Mock {
+                transition_step_ms, ..
+            } => *transition_step_ms,
         }
     }
 
