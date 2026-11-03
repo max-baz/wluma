@@ -17,7 +17,11 @@ pub enum Brightness {
         get: Vec<u64>,
         set: Vec<u64>,
         change_threshold: u64,
-        transition_step_ms: u64,
+        min: u64,
+        max: u64,
+        get_error: bool,
+        set_error: bool,
+        get_gate: Option<smol::channel::Receiver<()>>,
         set_gate: Option<smol::channel::Receiver<()>>,
     },
 }
@@ -29,7 +33,18 @@ impl Brightness {
             Brightness::Backlight(b) => b.get().await,
 
             #[cfg(test)]
-            Brightness::Mock { get, .. } => Ok(get.remove(0)),
+            Brightness::Mock {
+                get,
+                get_error,
+                get_gate,
+                ..
+            } => {
+                if let Some(gate) = get_gate.take() {
+                    gate.recv().await?;
+                }
+                anyhow::ensure!(!*get_error, "Read failed");
+                Ok(get.remove(0))
+            }
         }
     }
 
@@ -39,11 +54,17 @@ impl Brightness {
             Brightness::Backlight(b) => b.set(value).await,
 
             #[cfg(test)]
-            Brightness::Mock { set, set_gate, .. } => {
+            Brightness::Mock {
+                set,
+                set_gate,
+                set_error,
+                ..
+            } => {
                 if let Some(gate) = set_gate.take() {
                     gate.recv().await?;
                 }
                 assert_eq!(set.remove(0), value);
+                anyhow::ensure!(!*set_error, "Write failed");
                 Ok(value)
             }
         }
@@ -55,7 +76,7 @@ impl Brightness {
             Brightness::Backlight(b) => b.min(),
 
             #[cfg(test)]
-            Brightness::Mock { .. } => 0,
+            Brightness::Mock { min, .. } => *min,
         }
     }
 
@@ -65,7 +86,7 @@ impl Brightness {
             Brightness::Backlight(b) => b.max(),
 
             #[cfg(test)]
-            Brightness::Mock { .. } => 100,
+            Brightness::Mock { max, .. } => *max,
         }
     }
 
@@ -85,18 +106,6 @@ impl Brightness {
             .checked_div(100)
             .unwrap_or(0)
             .clamp(self.min(), self.max())
-    }
-
-    pub fn transition_step_ms(&self) -> u64 {
-        match self {
-            Brightness::DdcUtil(b) => b.transition_step_ms(),
-            Brightness::Backlight(b) => b.transition_step_ms(),
-
-            #[cfg(test)]
-            Brightness::Mock {
-                transition_step_ms, ..
-            } => *transition_step_ms,
-        }
     }
 
     pub fn change_threshold(&self) -> u64 {

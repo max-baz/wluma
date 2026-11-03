@@ -10,7 +10,6 @@ const INTERFACE: &str = "com.ddcutil.DdcutilInterface";
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DDC_BRIGHTNESS_FEATURE: FeatureCode = 0x10;
 const DDC_WAITING_SLEEP_MS: u64 = 500;
-const DDC_TRANSITION_STEP_MS: u64 = 50;
 
 type DetectedDisplay = (i32, i32, i32, String, String, String, u16, String, u32);
 
@@ -135,10 +134,6 @@ impl DdcUtil {
 
     pub fn waiting_sleep_ms(&self) -> u64 {
         DDC_WAITING_SLEEP_MS
-    }
-
-    pub fn transition_step_ms(&self) -> u64 {
-        DDC_TRANSITION_STEP_MS
     }
 }
 

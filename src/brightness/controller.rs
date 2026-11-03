@@ -2,13 +2,14 @@ use smol::channel::{Receiver, Sender};
 use smol::Timer;
 
 use crate::channel_ext::ReceiverExt;
+use crate::transition::{IoTiming, Scalar};
 
 use super::Brightness;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const TRANSITION_DURATION_MS: u64 = 200;
+const TRANSITION_INTERVAL: Duration = Duration::from_millis(16);
 
 pub struct Controller {
     brightness: Brightness,
@@ -16,7 +17,9 @@ pub struct Controller {
     prediction_rx: Receiver<u64>,
     prediction: Option<u64>,
     current: Option<u64>,
-    target: Option<Target>,
+    target: Option<Scalar>,
+    timing: IoTiming,
+    io_failed: bool,
     commands: Option<Receiver<Command>>,
     status: Option<(crate::control::Hub, String)>,
     paused_until: Option<Option<Instant>>,
@@ -40,18 +43,6 @@ pub enum CommandAction {
     IdleLeave,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-struct Target {
-    desired: u64,
-    step: i64,
-}
-
-impl Target {
-    fn reached(&self, current: u64) -> bool {
-        (self.step > 0 && current >= self.desired) || (self.step < 0 && current <= self.desired)
-    }
-}
-
 impl Controller {
     pub fn new(brightness: Brightness, user_tx: Sender<u64>, prediction_rx: Receiver<u64>) -> Self {
         Self {
@@ -61,6 +52,8 @@ impl Controller {
             prediction: None,
             current: None,
             target: None,
+            timing: IoTiming::default(),
+            io_failed: false,
             commands: None,
             status: None,
             paused_until: None,
@@ -102,7 +95,10 @@ impl Controller {
             self.wait().await;
             return;
         }
-        match self.brightness.get().await {
+        let cycle_started = Instant::now();
+        let observed = self.brightness.get().await;
+        let read_elapsed = cycle_started.elapsed();
+        match observed {
             Ok(new_brightness) => {
                 let predicted_value = self
                     .prediction_rx
@@ -119,6 +115,10 @@ impl Controller {
                     return self.update_current(new_brightness).await;
                 }
 
+                if self.io_failed {
+                    self.rebase_target(Instant::now());
+                    self.io_failed = false;
+                }
                 if let Some((status, output)) = &self.status {
                     status.set_brightness(output, self.brightness.percent(new_brightness));
                 }
@@ -126,15 +126,23 @@ impl Controller {
                 // 2. check if predictor wants to set a new value
                 if let Some(prediction) = predicted_value {
                     self.prediction = Some(prediction);
-                    self.update_target(self.apply_idle_reduction(prediction));
+                    self.update_target(self.apply_idle_reduction(prediction), Instant::now());
+                } else if let Some(target) = self.target {
+                    self.update_target(target.destination(), Instant::now());
                 }
 
                 // 3. continue the transition if there is one in progress
                 if self.target.is_some() {
-                    return self.transition().await;
+                    self.transition(read_elapsed, Instant::now()).await;
+                    self.wait_until(cycle_started + TRANSITION_INTERVAL).await;
+                    return;
                 }
             }
-            Err(err) => log::error!("Unable to get brightness value: {:?}", err),
+            Err(err) => {
+                self.io_failed = true;
+                self.rebase_target(Instant::now());
+                log::error!("Unable to get brightness value: {:?}", err);
+            }
         };
 
         // 4. nothing to do, sleep and check again
@@ -144,17 +152,38 @@ impl Controller {
 
     async fn wait(&mut self) {
         let delay = Duration::from_millis(self.brightness.waiting_sleep_ms());
+        self.wait_until(Instant::now() + delay).await;
+    }
+
+    async fn wait_until(&mut self, mut deadline: Instant) {
         if let Some(commands) = self.commands.clone() {
-            let command = smol::future::race(async { commands.recv().await.ok() }, async {
-                Timer::after(delay).await;
-                None
-            })
-            .await;
-            if let Some(command) = command {
-                self.command(command).await;
+            while Instant::now() < deadline {
+                let command = smol::future::race(
+                    async {
+                        if let Ok(command) = commands.recv().await {
+                            Some(command)
+                        } else {
+                            Timer::at(deadline).await;
+                            None
+                        }
+                    },
+                    async {
+                        Timer::at(deadline).await;
+                        None
+                    },
+                )
+                .await;
+                if let Some(command) = command {
+                    self.command(command).await;
+                    if !self.is_paused() && (self.resuming || self.target.is_some()) {
+                        deadline = deadline.min(Instant::now() + TRANSITION_INTERVAL);
+                    }
+                } else {
+                    break;
+                }
             }
         } else {
-            Timer::after(delay).await;
+            Timer::at(deadline).await;
         }
     }
 
@@ -393,57 +422,78 @@ impl Controller {
             .map_or("unknown", |(_, output)| output.as_str())
     }
 
-    fn update_target(&mut self, desired: u64) {
-        match (&self.target, self.current) {
-            (Some(old_target), _) if old_target.desired == desired => (),
-            (_, Some(current))
-                if desired.abs_diff(current) < self.brightness.change_threshold() =>
-            {
-                self.target = None;
-            }
-            (_, Some(current)) => {
-                let transition_steps = TRANSITION_DURATION_MS
-                    .div_ceil(self.brightness.transition_step_ms())
-                    .max(1);
-                let step = if desired > current {
-                    (desired - current).div_ceil(transition_steps) as i64
-                } else {
-                    -((current - desired).div_ceil(transition_steps) as i64)
-                };
-                self.target = Some(Target { desired, step });
-            }
-            _ => unreachable!("Current value cannot be None at this point"),
-        };
+    fn rebase_target(&mut self, now: Instant) {
+        if let (Some(target), Some(current)) = (&mut self.target, self.current) {
+            target.rebase(current, now);
+        }
     }
 
-    async fn transition(&mut self) {
-        match (&self.target, self.current) {
-            (Some(target), Some(current)) => {
-                if target.reached(current) {
-                    self.target = None;
-                } else {
-                    let started = Instant::now();
-                    let interval = Duration::from_millis(self.brightness.transition_step_ms());
-                    let new_value = current
-                        .saturating_add_signed(target.step)
-                        .clamp(current.min(target.desired), current.max(target.desired));
-                    match self.brightness.set(new_value).await {
-                        Ok(set_value) => {
-                            if set_value == current {
-                                log::warn!("Unable to change brightness from {current} to {new_value}, please report if you know how to reproduce this");
-                            }
-                            self.current = Some(set_value);
-                        }
-                        Err(err) => log::error!(
-                            "Unable to set brightness to value '{}': {:?}",
-                            new_value,
-                            err
-                        ),
-                    };
-                    Timer::at(started + interval).await;
+    fn update_target(&mut self, desired: u64, now: Instant) {
+        let min = self.brightness.min();
+        let max = self.brightness.max();
+        let desired = desired.clamp(min, max);
+        let continuing = self
+            .target
+            .is_some_and(|target| target.destination().clamp(min, max) == desired);
+        let current = self.current.expect("Current value is available");
+        if desired == current {
+            self.target = None;
+            return;
+        }
+        if self
+            .target
+            .is_some_and(|target| target.destination() == desired)
+        {
+            return;
+        }
+        if !continuing && desired.abs_diff(current) < self.brightness.change_threshold() {
+            self.target = None;
+        } else if let Some(target) = &mut self.target {
+            target.retarget(desired, now);
+        } else {
+            self.target = Some(Scalar::new(
+                current,
+                desired,
+                self.timing.tau(TRANSITION_INTERVAL),
+                now,
+            ));
+        }
+    }
+
+    async fn transition(&mut self, read_elapsed: Duration, now: Instant) {
+        let target = self.target.as_mut().expect("Target is available");
+        let desired = target.destination();
+        let current = self.current.expect("Current value is available");
+        let new_value = target
+            .advance(now)
+            .clamp(self.brightness.min(), self.brightness.max());
+        if new_value != current {
+            let started = Instant::now();
+            let result = self.brightness.set(new_value).await;
+            let write_elapsed = started.elapsed();
+            match result {
+                Ok(set_value) => {
+                    if set_value == current {
+                        log::warn!("Unable to change brightness from {current} to {new_value}, please report if you know how to reproduce this");
+                    }
+                    self.current = Some(set_value);
+                    self.timing
+                        .record(read_elapsed.saturating_add(write_elapsed));
+                    target.set_tau(self.timing.tau(TRANSITION_INTERVAL), Instant::now());
+                }
+                Err(err) => {
+                    self.io_failed = true;
+                    self.rebase_target(Instant::now());
+                    log::error!(
+                        "Unable to set brightness to value '{}': {:?}",
+                        new_value,
+                        err
+                    );
                 }
             }
-            _ => unreachable!("Current and target values cannot be None at this point"),
+        }
+        if self.current == Some(desired) {
+            self.target = None;
         }
     }
 }
@@ -457,8 +507,17 @@ mod tests {
     use smol_macros::test;
 
     // Intentionally not in main code to prevent confusing fields by accident
-    fn target(desired: u64, step: i64) -> Target {
-        Target { desired, step }
+    fn target(desired: u64, from: u64) -> Scalar {
+        Scalar::new(from, desired, Duration::from_millis(200), Instant::now())
+    }
+
+    fn ready_target(from: u64, desired: u64) -> Scalar {
+        Scalar::new(
+            from,
+            desired,
+            Duration::from_millis(200),
+            Instant::now() - Duration::from_secs(10),
+        )
     }
 
     fn brightness_mock(get: Vec<u64>, set: Vec<u64>) -> Brightness {
@@ -466,7 +525,11 @@ mod tests {
             get,
             set,
             change_threshold: 1,
-            transition_step_ms: 1,
+            min: 0,
+            max: 100,
+            get_error: false,
+            set_error: false,
+            get_gate: None,
             set_gate: None,
         }
     }
@@ -570,212 +633,326 @@ mod tests {
     }
 
     #[test]
-    fn test_update_target_ignore_when_desired_didnt_change() {
-        let old_target = Some(target(10, -20));
+    fn targets_are_normalized_and_same_prediction_keeps_progress() {
         let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
-        controller.target = old_target;
-        controller.current = Some(7);
-
-        controller.update_target(10);
-
-        assert_eq!(old_target, controller.target);
-    }
-
-    #[test]
-    fn test_update_target_cancels_when_desired_equals_current() {
-        let old_target = Some(target(10, -20));
-        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
-        controller.target = old_target;
-        controller.current = Some(7);
-
-        controller.update_target(7);
-
-        assert_eq!(None, controller.target);
-    }
-
-    #[test]
-    fn test_update_target_ignores_changes_below_device_threshold() {
-        let (user_tx, _) = channel::bounded(1);
-        let (_, prediction_rx) = channel::bounded(1);
-        let brightness = Brightness::Mock {
-            get: vec![],
-            set: vec![],
-            change_threshold: 20,
-            transition_step_ms: 1,
-            set_gate: None,
-        };
-        let mut controller = Controller::new(brightness, user_tx, prediction_rx);
-        controller.current = Some(10000);
-        controller.target = Some(target(11000, 5));
-
-        controller.update_target(10019);
-
-        assert_eq!(None, controller.target);
-
-        controller.update_target(10020);
-
-        assert_eq!(Some(target(10020, 1)), controller.target);
-    }
-
-    #[test]
-    fn test_update_target_finds_minimal_step_for_nominal_transition_duration() {
-        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
-
-        let test_cases = vec![
-            (0, 1, 1),
-            (10000, 10001, 1),
-            (10000, 10013, 1),
-            (10000, 10199, 1),
-            (10000, 10200, 1),
-            (10000, 10413, 3),
-            (10000, 11732, 9),
-            (10000, 9999, -1),
-            (10000, 9983, -1),
-            (10000, 9801, -1),
-            (10000, 9800, -1),
-            (10000, 9473, -3),
-            (10000, 8433, -8),
-        ];
-
-        for (current, desired, expected_step) in test_cases {
-            controller.current = Some(current);
-            controller.update_target(desired);
-            assert_eq!(Some(target(desired, expected_step)), controller.target);
+        if let Brightness::Mock { min, max, .. } = &mut controller.brightness {
+            *min = 5;
+            *max = 80;
         }
+        let now = Instant::now();
+        controller.current = Some(50);
+        controller.update_target(1000, now);
+        let original = controller.target.unwrap();
+        assert_eq!(80, original.destination());
+        controller.update_target(u64::MAX, now + Duration::from_millis(100));
+        assert_eq!(Some(original), controller.target);
+        controller.update_target(0, now + Duration::from_millis(100));
+        assert_eq!(5, controller.target.unwrap().destination());
+        assert_eq!(62, controller.target.unwrap().output());
+        controller.update_target(50, now);
+        assert!(controller.target.is_none());
     }
 
-    #[apply(test!)]
-    async fn test_transition_reset_target_when_reached() {
+    #[test]
+    fn deadband_cancels_new_predictions_but_not_an_existing_endpoint() {
         let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
-        controller.current = Some(10);
-        controller.target = Some(target(10, 20));
-
-        controller.transition().await;
-
-        assert_eq!(None, controller.target);
-    }
-
-    #[apply(test!)]
-    async fn test_transition_increases_brightness_with_next_step() {
-        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![12]));
-        controller.current = Some(10);
-        controller.target = Some(target(20, 2));
-
-        controller.transition().await;
-
-        assert_eq!(Some(12), controller.current);
-        assert!(is_brightness_spent(&controller.brightness));
-    }
-
-    #[apply(test!)]
-    async fn test_transition_decreases_brightness_with_next_step() {
-        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![9]));
-        controller.current = Some(10);
-        controller.target = Some(target(9, -1));
-
-        controller.transition().await;
-
-        assert_eq!(Some(9), controller.current);
-        assert!(is_brightness_spent(&controller.brightness));
-    }
-
-    #[apply(test!)]
-    async fn test_transition_yields_during_interval() {
-        let mut brightness = brightness_mock(vec![], vec![12]);
         if let Brightness::Mock {
-            transition_step_ms, ..
-        } = &mut brightness
+            change_threshold, ..
+        } = &mut controller.brightness
         {
-            *transition_step_ms = 1000;
+            *change_threshold = 20;
         }
-        let (mut controller, _, _) = setup(brightness);
-        controller.current = Some(10);
-        controller.target = Some(target(20, 2));
-
-        let mut transition = Box::pin(controller.transition());
-        assert!(smol::future::poll_once(transition.as_mut()).await.is_none());
-        drop(transition);
-
-        assert_eq!(Some(12), controller.current);
-        assert!(is_brightness_spent(&controller.brightness));
+        let now = Instant::now();
+        controller.current = Some(50);
+        controller.update_target(100, now);
+        controller.update_target(69, now);
+        assert!(controller.target.is_none());
+        controller.update_target(70, now);
+        assert_eq!(70, controller.target.unwrap().destination());
+        controller.current = Some(65);
+        let original = controller.target;
+        controller.update_target(70, now + Duration::from_millis(100));
+        assert_eq!(original, controller.target);
     }
 
     #[apply(test!)]
-    async fn test_slow_write_uses_original_deadline_and_fixed_step() -> Result<()> {
-        let (release_tx, release_rx) = channel::bounded(1);
-        let mut brightness = brightness_mock(vec![], vec![12, 14]);
-        if let Brightness::Mock {
-            transition_step_ms,
-            set_gate,
-            ..
-        } = &mut brightness
-        {
-            *transition_step_ms = 50;
-            *set_gate = Some(release_rx);
-        }
-        let (mut controller, _, _) = setup(brightness);
-        controller.current = Some(10);
-        controller.target = Some(target(20, 2));
-
-        let mut transition = Box::pin(controller.transition());
-        assert!(smol::future::poll_once(transition.as_mut()).await.is_none());
-        Timer::after(Duration::from_millis(100)).await;
-        release_tx.try_send(())?;
-        assert!(smol::future::poll_once(transition.as_mut()).await.is_some());
-        drop(transition);
-
-        assert_eq!(Some(12), controller.current);
-        assert_eq!(Some(target(20, 2)), controller.target);
-        controller.transition().await;
-        assert_eq!(Some(14), controller.current);
-        assert_eq!(Some(target(20, 2)), controller.target);
-        assert!(is_brightness_spent(&controller.brightness));
-        Ok(())
-    }
-
-    #[apply(test!)]
-    async fn test_transition_clamps_to_target_in_both_directions() {
-        for (current, desired, step) in [(59, 70, 13), (33, 20, -14)] {
-            let (mut controller, _, _) = setup(brightness_mock(vec![], vec![desired]));
-            controller.current = Some(current);
-            controller.target = Some(target(desired, step));
-
-            controller.transition().await;
-
-            assert_eq!(Some(desired), controller.current);
-            assert!(is_brightness_spent(&controller.brightness));
-
-            controller.transition().await;
-
-            assert_eq!(None, controller.target);
-        }
-    }
-
-    #[apply(test!)]
-    async fn test_step_cancels_obsolete_transition() -> Result<()> {
+    async fn step_suppresses_duplicates_and_finishes_rounded_endpoint() -> Result<()> {
         let (mut controller, prediction_tx, user_rx) = setup(brightness_mock(vec![50], vec![]));
         controller.current = Some(50);
-        controller.target = Some(target(70, 2));
-        prediction_tx.send(50).await?;
-
+        controller.target = Some(Scalar::new(
+            50,
+            100,
+            Duration::from_millis(200),
+            Instant::now() + Duration::from_secs(10),
+        ));
         controller.step().await;
-
         assert_eq!(Some(50), controller.current);
-        assert_eq!(None, controller.target);
+        assert!(controller.target.is_some());
+        assert_eq!(IoTiming::default(), controller.timing);
+        assert!(is_brightness_spent(&controller.brightness));
         assert!(user_rx.is_empty());
+        prediction_tx.send(50).await?;
+        if let Brightness::Mock { get, .. } = &mut controller.brightness {
+            get.push(50);
+        }
+        controller.step().await;
+        assert!(controller.target.is_none());
+
+        for (current, desired) in [(0, 1), (1, 0), (0, 2), (2, 3)] {
+            let (mut controller, _, _) =
+                setup(brightness_mock(vec![current, desired], vec![desired]));
+            controller.current = Some(current);
+            controller.target = Some(ready_target(current, desired));
+            controller.step().await;
+            assert_eq!(Some(desired), controller.current);
+            assert!(controller.target.is_none());
+            controller.step().await;
+            assert!(is_brightness_spent(&controller.brightness));
+        }
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn step_uses_latest_prediction_not_obsolete_direction() -> Result<()> {
+        for (current, desired) in [(80, 20), (20, 80)] {
+            let (mut controller, prediction_tx, user_rx) =
+                setup(brightness_mock(vec![current], vec![]));
+            controller.current = Some(current);
+            let obsolete = if desired < current { 100 } else { 0 };
+            controller.target = Some(target(obsolete, current));
+            prediction_tx.send(obsolete).await?;
+            prediction_tx.send(desired).await?;
+            controller.step().await;
+            assert_eq!(Some(current), controller.current);
+            assert_eq!(desired, controller.target.unwrap().destination());
+            assert!(controller.prediction_rx.is_empty());
+            assert!(user_rx.is_empty());
+            assert!(is_brightness_spent(&controller.brightness));
+        }
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn active_target_normalizes_after_maximum_shrinks_with_equivalent_predictions() {
+        for prediction in [None, Some(60), Some(1000), Some(u64::MAX)] {
+            let (mut controller, prediction_tx, user_rx) =
+                setup(brightness_mock(vec![50, 60], vec![60]));
+            controller.current = Some(50);
+            controller.target = Some(ready_target(50, 100));
+            if let Brightness::Mock {
+                max,
+                change_threshold,
+                ..
+            } = &mut controller.brightness
+            {
+                *max = 60;
+                *change_threshold = 20;
+            }
+            if let Some(prediction) = prediction {
+                prediction_tx.try_send(prediction).unwrap();
+            }
+            controller.step().await;
+            assert_eq!(Some(60), controller.current);
+            assert!(controller.target.is_none());
+            let timing = controller.timing;
+            controller.step().await;
+            assert_eq!(Some(60), controller.current);
+            assert!(controller.target.is_none());
+            assert_eq!(timing, controller.timing);
+            assert!(controller.prediction_rx.is_empty());
+            assert!(user_rx.is_empty());
+            assert!(is_brightness_spent(&controller.brightness));
+        }
+    }
+
+    #[apply(test!)]
+    async fn transition_writes_intermediate_values_in_both_directions() {
+        for (current, desired, expected) in [(10, 20, 14), (20, 10, 16)] {
+            let (mut controller, _, user_rx) = setup(brightness_mock(vec![], vec![expected]));
+            let now = Instant::now();
+            controller.current = Some(current);
+            controller.update_target(desired, now);
+            controller
+                .transition(Duration::ZERO, now + Duration::from_millis(100))
+                .await;
+            assert_eq!(Some(expected), controller.current);
+            assert_eq!(desired, controller.target.unwrap().destination());
+            assert_ne!(IoTiming::default(), controller.timing);
+            assert!(user_rx.is_empty());
+            assert!(is_brightness_spent(&controller.brightness));
+        }
+    }
+
+    #[apply(test!)]
+    async fn slow_read_and_write_consume_cadence_and_only_io_is_measured() -> Result<()> {
+        let (get_tx, get_rx) = channel::bounded(1);
+        let (set_tx, set_rx) = channel::bounded(1);
+        let mut brightness = brightness_mock(vec![0], vec![100]);
+        if let Brightness::Mock {
+            get_gate, set_gate, ..
+        } = &mut brightness
+        {
+            *get_gate = Some(get_rx);
+            *set_gate = Some(set_rx);
+        }
+        let (mut controller, _, _) = setup(brightness);
+        controller.current = Some(0);
+        controller.target = Some(ready_target(0, 100));
+        let mut step = Box::pin(controller.step());
+        assert!(smol::future::poll_once(step.as_mut()).await.is_none());
+        let read_started = Instant::now();
+        Timer::after(Duration::from_millis(30)).await;
+        let read_blocked = read_started.elapsed();
+        get_tx.try_send(())?;
+        assert!(smol::future::poll_once(step.as_mut()).await.is_none());
+        let write_started = Instant::now();
+        Timer::after(Duration::from_millis(30)).await;
+        let write_blocked = write_started.elapsed();
+        set_tx.try_send(())?;
+        assert!(smol::future::poll_once(step.as_mut()).await.is_some());
+        drop(step);
+        assert_eq!(Some(100), controller.current);
+        assert!(controller.target.is_none());
+        assert!(is_brightness_spent(&controller.brightness));
+        assert!(
+            controller.timing.tau(TRANSITION_INTERVAL)
+                >= ((read_blocked + write_blocked) * 8).min(Duration::from_secs(1))
+        );
+        let timing = controller.timing;
+        controller
+            .wait_until(Instant::now() + Duration::from_millis(30))
+            .await;
+        assert_eq!(timing, controller.timing);
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn transition_wait_yields_and_handles_commands() -> Result<()> {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
+        let (commands_tx, commands_rx) = channel::bounded(1);
+        controller.commands = Some(commands_rx);
+        controller.current = Some(50);
+        controller.target = Some(ready_target(50, 100));
+        let mut wait = Box::pin(controller.wait_until(Instant::now() + Duration::from_secs(60)));
+        assert!(smol::future::poll_once(wait.as_mut()).await.is_none());
+        let (response_tx, response_rx) = channel::bounded(1);
+        commands_tx
+            .send(Command {
+                action: CommandAction::Pause(None),
+                response: response_tx,
+            })
+            .await?;
+        assert!(smol::future::poll_once(wait.as_mut()).await.is_none());
+        assert_eq!(Ok(50), response_rx.try_recv()?);
+        drop(wait);
+        assert!(controller.is_paused());
+        assert!(controller.target.is_none());
         assert!(is_brightness_spent(&controller.brightness));
         Ok(())
     }
 
     #[apply(test!)]
-    async fn test_transition_doesnt_decrease_below_0() {
-        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![0]));
-        controller.current = Some(1);
-        controller.target = Some(target(0, -2)); // step of -2 should not overshoot
+    async fn read_and_write_errors_rebase_and_retry_without_false_completion() {
+        for read_fails in [true, false] {
+            let mut brightness = brightness_mock(
+                if read_fails { vec![] } else { vec![50] },
+                if read_fails { vec![] } else { vec![100] },
+            );
+            if let Brightness::Mock {
+                get_error,
+                set_error,
+                ..
+            } = &mut brightness
+            {
+                *get_error = read_fails;
+                *set_error = !read_fails;
+            }
+            let (mut controller, _, user_rx) = setup(brightness);
+            controller.current = Some(50);
+            controller.target = Some(ready_target(50, 100));
+            let retry_interval = if read_fails {
+                Duration::from_millis(controller.brightness.waiting_sleep_ms())
+            } else {
+                TRANSITION_INTERVAL
+            };
+            let started = Instant::now();
+            controller.step().await;
+            assert!(started.elapsed() >= retry_interval);
+            assert_eq!(Some(50), controller.current);
+            assert_eq!(50, controller.target.unwrap().output());
+            assert_eq!(100, controller.target.unwrap().destination());
+            assert_eq!(IoTiming::default(), controller.timing);
+            assert!(user_rx.is_empty());
+            assert!(is_brightness_spent(&controller.brightness));
+            if let Brightness::Mock {
+                get_error,
+                set_error,
+                get,
+                set,
+                ..
+            } = &mut controller.brightness
+            {
+                *get_error = false;
+                *set_error = false;
+                get.push(50);
+                set.push(100);
+            }
+            controller.step().await;
+            assert_eq!(Some(50), controller.current);
+            assert_eq!(50, controller.target.unwrap().output());
+            assert_eq!(IoTiming::default(), controller.timing);
+            controller
+                .transition(Duration::ZERO, Instant::now() + Duration::from_secs(2))
+                .await;
+            assert_eq!(Some(100), controller.current);
+            assert!(controller.target.is_none());
+            assert_ne!(IoTiming::default(), controller.timing);
+            assert!(is_brightness_spent(&controller.brightness));
+        }
+    }
 
-        controller.transition().await;
+    #[apply(test!)]
+    async fn duplicate_outputs_keep_fractional_progress_without_learning() {
+        for (from, to) in [(0, 1), (1, 0)] {
+            let (mut controller, _, user_rx) = setup(brightness_mock(vec![to], vec![to]));
+            let now = Instant::now();
+            controller.current = Some(from);
+            controller.update_target(to, now);
+            for ms in (10..=130).step_by(10) {
+                let at = now + Duration::from_millis(ms);
+                controller.update_target(to, at);
+                controller.transition(Duration::ZERO, at).await;
+                assert_eq!(Some(from), controller.current);
+                assert!(controller.target.is_some());
+                assert_eq!(IoTiming::default(), controller.timing);
+            }
+            controller
+                .transition(Duration::ZERO, now + Duration::from_millis(140))
+                .await;
+            assert_eq!(Some(to), controller.current);
+            assert!(controller.target.is_none());
+            controller.step().await;
+            assert!(user_rx.is_empty());
+            assert!(is_brightness_spent(&controller.brightness));
+        }
+    }
 
-        assert_eq!(Some(0), controller.current);
+    #[apply(test!)]
+    async fn accepted_endpoint_finishes_inside_admission_deadband() {
+        let (mut controller, _, user_rx) = setup(brightness_mock(vec![65, 70], vec![70]));
+        if let Brightness::Mock {
+            change_threshold, ..
+        } = &mut controller.brightness
+        {
+            *change_threshold = 20;
+        }
+        controller.current = Some(65);
+        controller.target = Some(ready_target(50, 70));
+        controller.step().await;
+        assert_eq!(Some(70), controller.current);
+        assert!(controller.target.is_none());
+        controller.step().await;
+        assert!(user_rx.is_empty());
         assert!(is_brightness_spent(&controller.brightness));
     }
 
@@ -862,16 +1039,17 @@ mod tests {
     #[apply(test!)]
     async fn idle_reduction_tracks_and_restores_predictions() -> Result<()> {
         let (mut controller, prediction_tx, user_rx) =
-            setup(brightness_mock(vec![80, 24, 23], vec![24, 23, 70]));
+            setup(brightness_mock(vec![80, 24, 21], vec![24, 21, 70]));
         controller.current = Some(80);
 
         controller.execute(CommandAction::IdleEnter(30)).await?;
         assert_eq!(Some(24), controller.current);
         assert!(!controller.is_paused());
 
+        controller.target = Some(ready_target(24, 21));
         prediction_tx.send(70).await?;
         controller.step().await;
-        assert_eq!(Some(23), controller.current);
+        assert_eq!(Some(21), controller.current);
         assert_eq!(Some(70), controller.prediction);
 
         controller.execute(CommandAction::IdleLeave).await?;
@@ -1023,16 +1201,5 @@ mod tests {
             .await
             .is_err());
         assert!(!controller.is_paused());
-    }
-
-    #[test]
-    fn test_target_reached() {
-        assert!(!target(10, 1).reached(9));
-        assert!(target(10, 1).reached(10));
-        assert!(target(10, 1).reached(11));
-
-        assert!(target(10, -1).reached(9));
-        assert!(target(10, -1).reached(10));
-        assert!(!target(10, -1).reached(11));
     }
 }

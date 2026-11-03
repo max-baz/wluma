@@ -9,7 +9,6 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const TRANSITION_STEP_MS: u64 = 16;
 const BRIGHTNESS_STEPS: u64 = 1000;
 const POLLED_WRITE_SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -178,10 +177,6 @@ impl Backlight {
 
     pub fn max(&self) -> u64 {
         self.max_brightness
-    }
-
-    pub fn transition_step_ms(&self) -> u64 {
-        TRANSITION_STEP_MS
     }
 
     pub fn change_threshold(&self) -> u64 {

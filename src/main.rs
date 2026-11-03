@@ -17,6 +17,7 @@ mod idle;
 mod predictor;
 mod runtime;
 mod state;
+mod transition;
 
 /// Current app version (determined at compile-time).
 pub const VERSION: &str = env!("WLUMA_VERSION");
