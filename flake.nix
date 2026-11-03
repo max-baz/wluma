@@ -21,6 +21,7 @@
       in
       {
         defaultPackage = naersk-lib.buildPackage {
+          version = "unstable-${builtins.substring 0 8 self.lastModifiedDate}-${self.shortRev or self.dirtyShortRev or "dirty"}";
           src = ./.;
           meta.mainProgram = "wluma";
           nativeBuildInputs = with pkgs; [
