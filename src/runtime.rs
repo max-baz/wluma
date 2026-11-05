@@ -23,6 +23,7 @@ pub struct Runtime {
     sessions: HashMap<String, Session>,
     failures: HashMap<String, Instant>,
     started: HashSet<String>,
+    pauses: HashMap<String, brightness::PauseState>,
     last_discovery: Option<Instant>,
     settling_until: Option<Instant>,
     commands: Receiver<crate::control::Command>,
@@ -36,6 +37,7 @@ pub struct Runtime {
 
 struct Session {
     output: config::Output,
+    lifetime: brightness::Lifetime,
     active: Arc<AtomicBool>,
     brightness: Task<()>,
     capturer: Task<()>,
@@ -68,6 +70,7 @@ impl Runtime {
             sessions: HashMap::new(),
             failures: HashMap::new(),
             started: HashSet::new(),
+            pauses: HashMap::new(),
             last_discovery: None,
             settling_until: None,
             commands,
@@ -133,7 +136,7 @@ impl Runtime {
             .sessions
             .drain()
             .map(|(_, session)| async move {
-                if idle {
+                if idle && session.lifetime.is_valid() {
                     session.leave_idle().await;
                 }
                 session.stop().await;
@@ -365,6 +368,12 @@ impl Runtime {
                 self.settling_until = Some(Instant::now() + TOPOLOGY_SETTLE_INTERVAL);
             }
             self.discover().await;
+        } else if self
+            .sessions
+            .values()
+            .any(|session| !session.lifetime.is_valid())
+        {
+            self.discover().await;
         } else if settled {
             self.settling_until = None;
             self.discover().await;
@@ -400,16 +409,19 @@ impl Runtime {
             .sessions
             .iter()
             .filter(|(_, session)| {
-                session.brightness.is_finished()
-                    || session.capturer.is_finished()
-                    || session.gamma.as_ref().is_some_and(Task::is_finished)
+                session.lifetime.is_valid()
+                    && (session.brightness.is_finished()
+                        || session.capturer.is_finished()
+                        || session.gamma.as_ref().is_some_and(Task::is_finished))
             })
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         for name in stopped {
             if self.idle_brightness.is_some() {
                 if let Some(session) = self.sessions.get(&name) {
-                    session.leave_idle().await;
+                    if session.lifetime.is_valid() {
+                        session.leave_idle().await;
+                    }
                 }
             }
             if let Some(session) = self.sessions.remove(&name) {
@@ -423,13 +435,22 @@ impl Runtime {
         let removed = self
             .sessions
             .iter()
-            .filter(|(name, session)| self.desired.get(*name) != Some(&session.output))
+            .filter(|(name, session)| {
+                !session.lifetime.is_valid() || self.desired.get(*name) != Some(&session.output)
+            })
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         for name in removed {
+            if self.desired.contains_key(&name) {
+                if let Some(session) = self.sessions.get(&name) {
+                    session.lifetime.invalidate();
+                }
+            }
             if self.idle_brightness.is_some() {
                 if let Some(session) = self.sessions.get(&name) {
-                    session.leave_idle().await;
+                    if session.lifetime.is_valid() {
+                        session.leave_idle().await;
+                    }
                 }
             }
             if let Some(session) = self.sessions.remove(&name) {
@@ -458,9 +479,10 @@ impl Runtime {
             .collect::<Vec<_>>();
         for (name, output) in pending {
             let learn_initial = !self.started.contains(&name);
+            let pause = self.pauses.entry(name.clone()).or_default().clone();
             match Session::start(
                 output,
-                learn_initial,
+                (learn_initial, pause),
                 self.als_scale,
                 &self.legacy_thresholds,
                 &self.registrations,
@@ -476,6 +498,7 @@ impl Runtime {
                     self.started.insert(name);
                 }
                 Err(error) => {
+                    self.status.remove_output(&name);
                     log::warn!("Unable to initialize output '{name}': {error:#}");
                     self.failures.insert(name, Instant::now());
                 }
@@ -487,18 +510,20 @@ impl Runtime {
 impl Session {
     async fn start(
         output: config::Output,
-        learn_initial: bool,
+        startup: (bool, brightness::PauseState),
         als_scale: als::Scale,
         legacy_thresholds: &HashMap<u64, String>,
         registrations: &Sender<Sender<als::Reading>>,
         status: crate::control::Hub,
         fatal_errors: Sender<String>,
     ) -> Result<Self> {
+        let (learn_initial, pause_state) = startup;
         let (als_tx, als_rx) = channel::bounded(1);
         let (user_tx, user_rx) = channel::bounded(128);
         let (prediction_tx, prediction_rx) = channel::bounded(128);
         let (command_tx, command_rx) = channel::bounded(32);
-        let paused = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(pause_state.is_paused()));
+        let lifetime = brightness::Lifetime::default();
 
         let (name, capturer, vulkan_device, output_predictor, als_direction, gamma_enabled) =
             match &output {
@@ -536,6 +561,7 @@ impl Session {
             }
         };
 
+        let maximum = backend.max();
         let keyboard = is_keyboard(&output);
         let kind = match &output {
             config::Output::Backlight(_) if keyboard => "keyboard",
@@ -549,19 +575,13 @@ impl Session {
         status.add_output(&name, kind, (!keyboard).then_some(capturer_name));
 
         registrations.send(als_tx).await?;
-        let brightness_status = status.clone();
-        let brightness_name = name.clone();
-        let brightness_paused = paused.clone();
-        let brightness = smol::spawn(async move {
+        let mut brightness_controller =
             brightness::Controller::new(backend, user_tx, prediction_rx)
-                .with_control(
-                    command_rx,
-                    brightness_status,
-                    brightness_name,
-                    brightness_paused,
-                )
-                .run()
-                .await;
+                .with_control(command_rx, status.clone(), name.clone(), paused.clone())
+                .with_lifetime(lifetime.clone(), pause_state);
+        let brightness_ready = brightness_controller.ready();
+        let brightness = smol::spawn(async move {
+            brightness_controller.run().await;
         });
 
         let mut additional = Vec::new();
@@ -585,7 +605,7 @@ impl Session {
                         als_scale,
                         legacy_thresholds,
                         predictor::Kind::Dim,
-                    )
+                    )?
                     .without_initial_value()
                     .with_als_direction(predictor::AlsDirection::Decreasing)
                     .with_luma_direction(
@@ -607,7 +627,7 @@ impl Session {
                         als_scale,
                         legacy_thresholds,
                         predictor::Kind::Temperature,
-                    )
+                    )?
                     .without_initial_value()
                     .without_luma(),
                 )
@@ -650,14 +670,13 @@ impl Session {
             }
             config::Predictor::Adaptive => {
                 let controller = predictor::controller::adaptive::Controller::new(
-                    prediction_tx,
-                    user_rx,
-                    als_rx,
+                    (prediction_tx, user_rx, als_rx),
                     true,
                     &name,
                     als_scale,
                     legacy_thresholds,
-                )
+                    maximum,
+                )?
                 .with_als_direction(als_direction);
                 predictor::Controller::adaptive(if learn_initial {
                     controller
@@ -667,6 +686,8 @@ impl Session {
             }
         }
         .with_additional(additional)
+        .with_enabled(brightness_ready)
+        .with_lifetime(lifetime.clone())
         .with_status(status.clone(), name.clone(), paused);
         let frame_capturer = match capturer {
             config::Capturer::Auto => frame::capturer::Capturer::Auto,
@@ -700,6 +721,7 @@ impl Session {
 
         Ok(Self {
             output,
+            lifetime,
             active,
             brightness,
             capturer,
@@ -720,6 +742,7 @@ impl Session {
     }
 
     async fn stop(self) {
+        self.lifetime.invalidate();
         // Stop prediction producers before their receivers. Otherwise a final
         // frame can race with controller cancellation and send into a closed
         // channel during graceful shutdown.
@@ -751,7 +774,7 @@ impl Session {
                 ),
             }
         }
-        self.brightness.cancel().await;
+        self.brightness.await;
         if let Some(gamma) = self.gamma {
             gamma.cancel().await;
         }
@@ -861,12 +884,15 @@ mod tests {
         let (commands, receiver) = channel::unbounded();
         let active = Arc::new(AtomicBool::new(true));
         let capture_active = active.clone();
+        let lifetime = brightness::Lifetime::default();
+        let brightness_lifetime = lifetime.clone();
         runtime.sessions.insert(
             name.to_string(),
             Session {
                 output,
+                lifetime,
                 active,
-                brightness: smol::spawn(std::future::pending()),
+                brightness: smol::spawn(async move { brightness_lifetime.changed().await }),
                 capturer: smol::spawn(async move {
                     while capture_active.load(Ordering::Relaxed) {
                         smol::Timer::after(Duration::from_millis(1)).await;
@@ -887,6 +913,97 @@ mod tests {
             brightness::CommandAction::IdleLeave
         ));
         command.response.send(Ok(80)).await.unwrap();
+    }
+
+    #[apply(test!)]
+    async fn same_path_replacement_restarts_session_and_retains_pause() {
+        let exercise = async {
+            let fixture = crate::brightness::test_support::BacklightFixture::new(255);
+            let mut runtime = runtime(false);
+            let (registrations, receivers) = channel::unbounded::<Sender<als::Reading>>();
+            runtime.registrations = registrations;
+            let als = smol::spawn(async move {
+                while let Ok(sender) = receivers.recv().await {
+                    let _ = sender
+                        .send(als::Reading {
+                            value: 20,
+                            stable: true,
+                        })
+                        .await;
+                }
+            });
+            runtime.desired.insert(
+                "panel".to_string(),
+                config::Output::Backlight(config::BacklightOutput {
+                    name: "panel".to_string(),
+                    path: fixture.path.to_str().unwrap().to_string(),
+                    capturer: config::Capturer::None,
+                    vulkan_device: config::VulkanDevice::Auto,
+                    min_brightness: 1,
+                    kind: config::BacklightKind::Display,
+                    predictor: config::Predictor::Manual { points: Vec::new() },
+                    als_direction: predictor::AlsDirection::Increasing,
+                    gamma: false,
+                    enabled: true,
+                }),
+            );
+            runtime.reconcile().await;
+            assert!(runtime.sessions.contains_key("panel"));
+            runtime
+                .execute(crate::control::Action::Pause(
+                    Some("panel".to_string()),
+                    Some(Duration::from_secs(60)),
+                ))
+                .await
+                .unwrap();
+            let old_lifetime = runtime.sessions["panel"].lifetime.clone();
+            fixture.replace(100);
+            smol::future::race(old_lifetime.changed(), async {
+                smol::Timer::after(Duration::from_secs(2)).await;
+                panic!("Replacement was not detected");
+            })
+            .await;
+            runtime.reconcile().await;
+            assert!(runtime.sessions["panel"].lifetime.is_valid());
+            assert!(runtime.pauses["panel"].is_paused());
+            assert!(!runtime.failures.contains_key("panel"));
+            assert_eq!(
+                50,
+                runtime
+                    .output_command("panel", brightness::CommandAction::Get)
+                    .await
+                    .unwrap()
+            );
+            runtime
+                .execute(crate::control::Action::Resume(Some("panel".to_string())))
+                .await
+                .unwrap();
+            runtime.stop().await;
+            als.cancel().await;
+        };
+        smol::future::race(exercise, async {
+            smol::Timer::after(Duration::from_secs(10)).await;
+            panic!("Session replacement did not finish");
+        })
+        .await;
+    }
+
+    #[apply(test!)]
+    async fn invalidated_idle_session_is_removed_without_stale_restoration() {
+        let mut runtime = runtime(true);
+        let commands = add_session(&mut runtime, "panel", false);
+        let session = runtime.sessions.get("panel").unwrap();
+        runtime
+            .desired
+            .insert("panel".to_string(), session.output.clone());
+        session.lifetime.invalidate();
+        runtime.started.insert("panel".to_string());
+        runtime.reconcile().await;
+        assert!(runtime.sessions.is_empty());
+        assert!(commands.is_empty());
+        assert!(runtime.started.contains("panel"));
+        assert!(runtime.desired.contains_key("panel"));
+        assert!(!runtime.failures.contains_key("panel"));
     }
 
     #[apply(test!)]

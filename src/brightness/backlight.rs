@@ -1,3 +1,4 @@
+use super::{validate_limits, BackendChanged};
 use crate::device_file::{read, write};
 use anyhow::{anyhow, Error, Result};
 use dbus::channel::Sender;
@@ -6,7 +7,8 @@ use inotify::{Inotify, WatchMask};
 use smol::fs::{File, OpenOptions};
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const BRIGHTNESS_STEPS: u64 = 1000;
@@ -41,6 +43,8 @@ struct Dbus {
 
 pub struct Backlight {
     file: File,
+    path: PathBuf,
+    identity: (u64, u64),
     min_brightness: u64,
     max_brightness: u64,
     inotify: Inotify,
@@ -54,10 +58,17 @@ pub struct Backlight {
 impl Backlight {
     pub async fn new(path: &str, min_brightness: u64) -> Result<Self> {
         let brightness_path = Path::new(path).join("brightness");
+        let max_brightness = fs::read_to_string(Path::new(path).join("max_brightness"))?
+            .trim()
+            .parse()?;
+        validate_limits(min_brightness, max_brightness)?;
+        let initial_metadata = fs::metadata(&brightness_path)?;
+        let identity = (initial_metadata.dev(), initial_metadata.ino());
 
-        let current_brightness = fs::read(&brightness_path)?;
-
-        let has_write_permission = fs::write(&brightness_path, current_brightness).is_ok();
+        let has_write_permission = fs::OpenOptions::new()
+            .write(true)
+            .open(&brightness_path)
+            .is_ok();
 
         let (file, dbus) = if has_write_permission {
             let file = OpenOptions::new()
@@ -108,9 +119,11 @@ impl Backlight {
             (file, connection)
         };
 
-        let max_brightness = fs::read_to_string(Path::new(path).join("max_brightness"))?
-            .trim()
-            .parse()?;
+        let opened_metadata = file.metadata().await?;
+        anyhow::ensure!(
+            identity == (opened_metadata.dev(), opened_metadata.ino()),
+            "Backlight changed during initialization"
+        );
 
         let inotify = Inotify::init()?;
         inotify.watches().add(&brightness_path, WatchMask::MODIFY)?;
@@ -124,8 +137,10 @@ impl Backlight {
 
         let poll_brightness = requires_polling(Path::new(path));
 
-        Ok(Self {
+        let backend = Self {
             file,
+            path: PathBuf::from(path),
+            identity,
             min_brightness,
             max_brightness,
             inotify,
@@ -134,10 +149,40 @@ impl Backlight {
             has_write_permission,
             pending_polled_write: None,
             poll_brightness,
+        };
+        backend.validate()?;
+        Ok(backend)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let check = || -> Result<()> {
+            let metadata = fs::metadata(self.path.join("brightness"))?;
+            anyhow::ensure!(
+                self.identity == (metadata.dev(), metadata.ino()),
+                "Backlight device was replaced"
+            );
+            let maximum: u64 = fs::read_to_string(self.path.join("max_brightness"))?
+                .trim()
+                .parse()?;
+            validate_limits(self.min_brightness, maximum)?;
+            anyhow::ensure!(
+                maximum == self.max_brightness,
+                "Backlight maximum changed from {} to {maximum}",
+                self.max_brightness
+            );
+            Ok(())
+        };
+        check().map_err(|error| {
+            BackendChanged(format!(
+                "Backlight '{}' is no longer valid: {error:#}",
+                self.path.display()
+            ))
+            .into()
         })
     }
 
     pub async fn get(&mut self) -> Result<u64> {
+        self.validate()?;
         async fn update(this: &mut Backlight) -> Result<u64> {
             let value = read(&mut this.file).await? as u64;
             this.current = Some(value.clamp(this.min_brightness, this.max_brightness));
@@ -187,6 +232,7 @@ impl Backlight {
     }
 
     pub async fn set(&mut self, value: u64) -> Result<u64> {
+        self.validate()?;
         let value = value.clamp(self.min_brightness, self.max_brightness);
 
         if self.has_write_permission {
@@ -223,6 +269,91 @@ impl Backlight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brightness::test_support::BacklightFixture;
+
+    #[test]
+    fn replacement_and_removal_invalidate_open_backlight() {
+        smol::block_on(async {
+            for recreate in [false, true] {
+                let fixture = BacklightFixture::new(255);
+                let mut backend = Backlight::new(fixture.path.to_str().unwrap(), 1)
+                    .await
+                    .unwrap();
+                backend.get().await.unwrap();
+                if recreate {
+                    fixture.replace(100);
+                } else {
+                    fixture.remove();
+                }
+                assert!(backend.get().await.unwrap_err().is::<BackendChanged>());
+                assert!(backend.set(248).await.unwrap_err().is::<BackendChanged>());
+                if recreate {
+                    assert_eq!(
+                        "50\n",
+                        fs::read_to_string(fixture.path.join("brightness")).unwrap()
+                    );
+                    assert_eq!(
+                        100,
+                        Backlight::new(fixture.path.to_str().unwrap(), 1)
+                            .await
+                            .unwrap()
+                            .max()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn maximum_changes_are_detected_without_inode_replacement() {
+        smol::block_on(async {
+            let fixture = BacklightFixture::new(255);
+            let mut backend = Backlight::new(fixture.path.to_str().unwrap(), 1)
+                .await
+                .unwrap();
+            fs::write(fixture.path.join("brightness"), "123\n").unwrap();
+            assert_eq!(123, backend.get().await.unwrap());
+            fs::write(fixture.path.join("max_brightness"), "100\n").unwrap();
+            assert!(backend.validate().unwrap_err().is::<BackendChanged>());
+            assert!(backend.set(99).await.is_err());
+            assert_eq!(
+                "123\n",
+                fs::read_to_string(fixture.path.join("brightness")).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn class_symlink_retargeting_invalidates_identity() {
+        smol::block_on(async {
+            let fixture = BacklightFixture::new(255);
+            let class = fixture.root.join("class");
+            std::os::unix::fs::symlink(&fixture.path, &class).unwrap();
+            let backend = Backlight::new(class.to_str().unwrap(), 1).await.unwrap();
+            let alternate = fixture.root.join("alternate");
+            fs::create_dir(&alternate).unwrap();
+            fs::write(alternate.join("brightness"), "50\n").unwrap();
+            fs::write(alternate.join("max_brightness"), "255\n").unwrap();
+            let next = fixture.root.join("next");
+            std::os::unix::fs::symlink(&alternate, &next).unwrap();
+            fs::rename(next, class).unwrap();
+            assert!(backend.validate().unwrap_err().is::<BackendChanged>());
+        });
+    }
+
+    #[test]
+    fn invalid_limits_fail_before_any_write() {
+        smol::block_on(async {
+            for (maximum, minimum) in [(0, 0), (100, 101)] {
+                let fixture = BacklightFixture::new(maximum);
+                let original = fs::read(fixture.path.join("brightness")).unwrap();
+                assert!(Backlight::new(fixture.path.to_str().unwrap(), minimum)
+                    .await
+                    .is_err());
+                assert_eq!(original, fs::read(fixture.path.join("brightness")).unwrap());
+            }
+        });
+    }
 
     #[test]
     fn led_brightness_requires_polling() {

@@ -4,15 +4,38 @@ use smol::Timer;
 use crate::channel_ext::ReceiverExt;
 use crate::transition::{IoTiming, Scalar};
 
-use super::Brightness;
+use super::{BackendChanged, Brightness, Lifetime};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TRANSITION_INTERVAL: Duration = Duration::from_millis(16);
 
+#[derive(Clone, Default)]
+pub struct PauseState(Arc<Mutex<Option<Option<Instant>>>>);
+
+impl PauseState {
+    fn current(&self) -> Option<Option<Instant>> {
+        let mut state = self.0.lock().unwrap();
+        if state
+            .flatten()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            *state = None;
+        }
+        *state
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.current().is_some()
+    }
+}
+
 pub struct Controller {
     brightness: Brightness,
+    lifetime: Lifetime,
+    pause_state: PauseState,
+    ready: Arc<AtomicBool>,
     user_tx: Sender<u64>,
     prediction_rx: Receiver<u64>,
     prediction: Option<u64>,
@@ -47,6 +70,9 @@ impl Controller {
     pub fn new(brightness: Brightness, user_tx: Sender<u64>, prediction_rx: Receiver<u64>) -> Self {
         Self {
             brightness,
+            lifetime: Lifetime::default(),
+            pause_state: PauseState::default(),
+            ready: Arc::new(AtomicBool::new(false)),
             user_tx,
             prediction_rx,
             prediction: None,
@@ -76,13 +102,73 @@ impl Controller {
         self
     }
 
+    pub fn ready(&self) -> Arc<AtomicBool> {
+        self.ready.clone()
+    }
+
+    pub fn with_lifetime(mut self, lifetime: Lifetime, pause_state: PauseState) -> Self {
+        self.lifetime = lifetime;
+        self.paused_until = pause_state.current();
+        self.pause_state = pause_state;
+        self.pause_state_changed(false);
+        self
+    }
+
+    fn checked<T>(&self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        if let Some(error) = result
+            .as_ref()
+            .err()
+            .filter(|error| error.is::<BackendChanged>())
+        {
+            log::info!(
+                "[{}] Brightness backend changed: {error:#}",
+                self.output_name()
+            );
+            self.lifetime.invalidate();
+        }
+        result
+    }
+
+    async fn read_brightness(&mut self) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            self.lifetime.is_valid(),
+            "Brightness backend is being replaced"
+        );
+        let result = self.brightness.get().await;
+        let value = self.checked(result)?;
+        anyhow::ensure!(
+            self.lifetime.is_valid(),
+            "Brightness backend is being replaced"
+        );
+        Ok(value)
+    }
+
+    async fn write_brightness(&mut self, value: u64) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            self.lifetime.is_valid(),
+            "Brightness backend is being replaced"
+        );
+        let result = self.brightness.set(value).await;
+        let value = self.checked(result)?;
+        anyhow::ensure!(
+            self.lifetime.is_valid(),
+            "Brightness backend is being replaced"
+        );
+        Ok(value)
+    }
+
     pub async fn run(&mut self) {
-        loop {
+        while self.lifetime.is_valid() {
             self.step().await;
         }
     }
 
     async fn step(&mut self) {
+        if self.is_paused() && self.lifetime.is_valid() {
+            if let Err(error) = self.checked(self.brightness.validate()) {
+                log::debug!("Brightness backend needs replacement: {error:#}");
+            }
+        }
         self.expire_pause().await;
         while let Some(command) = self
             .commands
@@ -91,26 +177,33 @@ impl Controller {
         {
             self.command(command).await;
         }
-        if self.is_paused() {
+        if self.is_paused() || !self.lifetime.is_valid() {
             self.wait().await;
             return;
         }
         let cycle_started = Instant::now();
-        let observed = self.brightness.get().await;
+        let observed = self.read_brightness().await;
         let read_elapsed = cycle_started.elapsed();
         match observed {
             Ok(new_brightness) => {
-                let predicted_value = self
-                    .prediction_rx
-                    .recv_maybe_last()
-                    .await
-                    .expect("prediction_rx closed unexpectedly");
+                let Ok(predicted_value) = self.prediction_rx.recv_maybe_last().await else {
+                    self.lifetime.invalidate();
+                    return;
+                };
 
                 // 1. check if user wants to learn a new value - this overrides any ongoing activity
                 if self.resuming {
                     self.resuming = false;
+                    let initializing = self.current.is_none();
                     self.current = Some(new_brightness);
                     self.target = None;
+                    if initializing {
+                        if self.user_tx.send(new_brightness).await.is_err() {
+                            self.lifetime.invalidate();
+                            return;
+                        }
+                        self.ready.store(true, Ordering::Release);
+                    }
                 } else if Some(new_brightness) != self.current {
                     return self.update_current(new_brightness).await;
                 }
@@ -193,14 +286,18 @@ impl Controller {
             status.set_brightness(output, self.brightness.percent(new_brightness));
         }
         if !self.is_paused() {
-            self.learn(new_brightness)
-                .await
-                .expect("Unable to send new brightness value set by user, channel is dead");
+            if let Err(error) = self.learn(new_brightness).await {
+                log::debug!("Unable to publish brightness adjustment: {error:#}");
+                self.lifetime.invalidate();
+            }
         }
         self.target = None;
     }
 
     async fn learn(&mut self, value: u64) -> anyhow::Result<()> {
+        if !self.lifetime.is_valid() {
+            return Ok(());
+        }
         if self.idle.is_some() {
             log::warn!(
                 "[{}] Ignoring brightness adjustment for learning while idle",
@@ -210,6 +307,7 @@ impl Controller {
         }
         self.prediction = Some(value);
         self.user_tx.send(value).await?;
+        self.ready.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -225,7 +323,7 @@ impl Controller {
         let mut result = None;
         match action {
             CommandAction::Get => {
-                let value = self.brightness.get().await?;
+                let value = self.read_brightness().await?;
                 if !self.is_paused() && Some(value) != self.current {
                     self.update_current(value).await;
                 }
@@ -233,11 +331,11 @@ impl Controller {
             }
             CommandAction::Set(adjustment) => {
                 let current = if self.is_paused() {
-                    self.brightness.get().await?
+                    self.read_brightness().await?
                 } else if let Some(current) = self.current {
                     current
                 } else {
-                    let current = self.brightness.get().await?;
+                    let current = self.read_brightness().await?;
                     self.update_current(current).await;
                     current
                 };
@@ -252,7 +350,7 @@ impl Controller {
                     adjustment.percent
                 };
                 let value = self.brightness.value_at_percent(percent);
-                let value = self.brightness.set(value).await?;
+                let value = self.write_brightness(value).await?;
                 result = Some(value);
                 if !self.is_paused() {
                     let _ = self.prediction_rx.recv_maybe_last().await?;
@@ -333,6 +431,7 @@ impl Controller {
     fn set_manual_paused(&mut self, paused_until: Option<Option<Instant>>) {
         let was_paused = self.is_paused();
         self.paused_until = paused_until;
+        *self.pause_state.0.lock().unwrap() = paused_until;
         self.pause_state_changed(was_paused);
     }
 
@@ -378,20 +477,20 @@ impl Controller {
     }
 
     async fn apply_idle(&mut self) -> anyhow::Result<u64> {
-        let current = self.brightness.get().await?;
+        let current = self.read_brightness().await?;
         let prediction = match self.prediction {
             Some(prediction) => prediction,
             None => {
                 self.prediction = Some(current);
                 if self.current.is_none() {
                     self.user_tx.send(current).await?;
+                    self.ready.store(true, Ordering::Release);
                 }
                 current
             }
         };
         let value = self
-            .brightness
-            .set(self.apply_idle_reduction(prediction))
+            .write_brightness(self.apply_idle_reduction(prediction))
             .await?;
         self.current = Some(value);
         if let Some((status, output)) = &self.status {
@@ -461,6 +560,10 @@ impl Controller {
     }
 
     async fn transition(&mut self, read_elapsed: Duration, now: Instant) {
+        if !self.lifetime.is_valid() {
+            self.target = None;
+            return;
+        }
         let target = self.target.as_mut().expect("Target is available");
         let desired = target.destination();
         let current = self.current.expect("Current value is available");
@@ -469,7 +572,14 @@ impl Controller {
             .clamp(self.brightness.min(), self.brightness.max());
         if new_value != current {
             let started = Instant::now();
-            let result = self.brightness.set(new_value).await;
+            let result = self.brightness.set_after_read(new_value).await;
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<BackendChanged>())
+            {
+                self.lifetime.invalidate();
+            }
             let write_elapsed = started.elapsed();
             match result {
                 Ok(set_value) => {
@@ -505,6 +615,162 @@ mod tests {
     use macro_rules_attribute::apply;
     use smol::channel;
     use smol_macros::test;
+
+    #[apply(test!)]
+    async fn resuming_a_replacement_started_paused_supplies_its_initial_baseline() {
+        let (mut controller, _, user_rx) = setup(brightness_mock(vec![50], vec![]));
+        controller
+            .execute(CommandAction::Pause(None))
+            .await
+            .unwrap();
+        controller.execute(CommandAction::Resume).await.unwrap();
+        assert!(!controller.ready.load(Ordering::Acquire));
+        controller.step().await;
+        assert!(controller.ready.load(Ordering::Acquire));
+        assert_eq!(50, user_rx.try_recv().unwrap());
+        assert!(user_rx.is_empty());
+        assert_eq!(Some(50), controller.current);
+        assert!(controller.prediction.is_none());
+    }
+
+    #[apply(test!)]
+    async fn invalidation_waits_for_inflight_io_without_publishing_stale_values() {
+        for during_write in [false, true] {
+            let (release, gate) = channel::bounded(1);
+            let mut backend =
+                brightness_mock(vec![50], if during_write { vec![100] } else { vec![] });
+            if let Brightness::Mock {
+                get_gate, set_gate, ..
+            } = &mut backend
+            {
+                if during_write {
+                    *set_gate = Some(gate);
+                } else {
+                    *get_gate = Some(gate);
+                }
+            }
+            let (mut controller, _, user_rx) = setup(backend);
+            controller.current = Some(50);
+            controller.target = Some(ready_target(50, 100));
+            let lifetime = controller.lifetime.clone();
+            let mut running = Box::pin(controller.run());
+            assert!(smol::future::poll_once(running.as_mut()).await.is_none());
+            lifetime.invalidate();
+            assert!(smol::future::poll_once(running.as_mut()).await.is_none());
+            release.send(()).await.unwrap();
+            smol::future::race(running, async {
+                Timer::after(Duration::from_secs(1)).await;
+                panic!("Brightness I/O did not finish during shutdown");
+            })
+            .await;
+            assert!(user_rx.is_empty());
+            assert!(is_brightness_spent(&controller.brightness));
+        }
+    }
+
+    #[apply(test!)]
+    async fn ddc_transition_reuses_its_immediately_preceding_read() {
+        let (mut controller, _, user_rx) =
+            setup(Brightness::DdcUtil(super::super::DdcUtil::mock(42, 100)));
+        controller.current = Some(42);
+        controller.target = Some(ready_target(42, 100));
+        controller.step().await;
+        assert_eq!(Some(100), controller.current);
+        assert!(user_rx.is_empty());
+        let Brightness::DdcUtil(ddc) = &controller.brightness else {
+            unreachable!()
+        };
+        assert_eq!(1, ddc.mock_reads());
+    }
+
+    #[apply(test!)]
+    async fn cached_cli_set_and_idle_restoration_detect_ddc_scale_changes() {
+        for action in [
+            CommandAction::Set(crate::control::Adjustment {
+                percent: 80,
+                relative: false,
+                increase: true,
+            }),
+            CommandAction::Get,
+            CommandAction::IdleLeave,
+        ] {
+            let mut ddc = super::super::DdcUtil::mock(42, 100);
+            ddc.mock_set_maximum(255);
+            let (mut controller, _, user_rx) = setup(Brightness::DdcUtil(ddc));
+            controller.current = Some(42);
+            controller.prediction = Some(248);
+            assert!(controller.execute(action).await.is_err());
+            assert!(!controller.lifetime.is_valid());
+            assert!(user_rx.is_empty());
+        }
+    }
+
+    #[apply(test!)]
+    async fn invalidated_backends_cannot_restore_idle_or_write_predictions() {
+        let (mut controller, _, user_rx) = setup(brightness_mock(vec![], vec![]));
+        controller.current = Some(50);
+        controller.prediction = Some(248);
+        controller.target = Some(ready_target(50, 100));
+        controller.lifetime.invalidate();
+        assert!(controller.execute(CommandAction::IdleLeave).await.is_err());
+        assert!(controller.execute(CommandAction::Get).await.is_err());
+        controller.transition(Duration::ZERO, Instant::now()).await;
+        assert!(controller.target.is_none());
+        assert!(user_rx.is_empty());
+        assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn backend_replacement_preserves_manual_pause_and_absolute_deadline() {
+        for duration in [None, Some(Duration::from_secs(60))] {
+            let state = PauseState::default();
+            let (controller, _, _) = setup(brightness_mock(vec![], vec![]));
+            let mut controller = controller.with_lifetime(Lifetime::default(), state.clone());
+            controller
+                .execute(CommandAction::Pause(duration))
+                .await
+                .unwrap();
+            let deadline = controller.paused_until;
+            controller.lifetime.invalidate();
+            drop(controller);
+            let (replacement, _, _) = setup(brightness_mock(vec![], vec![]));
+            let paused = Arc::new(AtomicBool::new(false));
+            let mut replacement = replacement.with_lifetime(Lifetime::default(), state.clone());
+            replacement.paused = Some(paused.clone());
+            replacement.pause_state_changed(false);
+            assert_eq!(deadline, replacement.paused_until);
+            assert!(paused.load(Ordering::Relaxed));
+            replacement.execute(CommandAction::Resume).await.unwrap();
+            assert!(!state.is_paused());
+        }
+        let expired = Instant::now() - Duration::from_secs(1);
+        let state = PauseState(Arc::new(Mutex::new(Some(Some(expired)))));
+        let (controller, _, _) = setup(brightness_mock(vec![], vec![]));
+        let controller = controller.with_lifetime(Lifetime::default(), state.clone());
+        assert!(!controller.is_paused());
+        assert!(!state.is_paused());
+    }
+
+    #[apply(test!)]
+    async fn paused_backlight_replacement_invalidates_without_learning() {
+        let fixture = crate::brightness::test_support::BacklightFixture::new(255);
+        let backend = super::super::Backlight::new(fixture.path.to_str().unwrap(), 1)
+            .await
+            .unwrap();
+        let (mut controller, _, user_rx) = setup(Brightness::Backlight(backend));
+        controller
+            .execute(CommandAction::Pause(None))
+            .await
+            .unwrap();
+        fixture.replace(100);
+        controller.step().await;
+        assert!(!controller.lifetime.is_valid());
+        assert!(user_rx.is_empty());
+        assert_eq!(
+            "50\n",
+            std::fs::read_to_string(fixture.path.join("brightness")).unwrap()
+        );
+    }
 
     // Intentionally not in main code to prevent confusing fields by accident
     fn target(desired: u64, from: u64) -> Scalar {

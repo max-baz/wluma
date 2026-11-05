@@ -82,12 +82,17 @@ impl Controller {
         let als = reading.value;
         if self.last_brightness.is_none() {
             // Brightness controller is expected to send the initial value on this channel asap
+            let initial = self
+                .user_rx
+                .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
+                .await
+                .expect("user_rx closed unexpectedly");
             self.last_brightness = self
                 .user_rx
                 .recv_maybe_last()
                 .await
                 .expect("user_rx closed unexpectedly")
-                .or_else(|| panic!("Did not receive initial brightness value"));
+                .or(Some(initial));
 
             self.process_brightness_change(self.last_brightness.unwrap(), als, luma);
         }
@@ -174,6 +179,35 @@ mod tests {
             Scale::Linear,
         );
         Ok((controller, user_tx, prediction_rx))
+    }
+
+    #[apply(test!)]
+    async fn initialization_waits_for_backend_sample_and_uses_latest_value() -> Result<()> {
+        let (als_tx, als_rx) = channel::bounded(1);
+        let (user_tx, user_rx) = channel::bounded(2);
+        let (prediction_tx, prediction_rx) = channel::bounded(1);
+        als_tx
+            .send(Reading {
+                value: ALS_DIM,
+                stable: true,
+            })
+            .await?;
+        let mut controller = Controller::new(
+            prediction_tx,
+            user_rx,
+            als_rx,
+            Vec::new(),
+            "panel",
+            Scale::Linear,
+        );
+        let mut adjustment = Box::pin(controller.adjust(0));
+        assert!(smol::future::poll_once(adjustment.as_mut()).await.is_none());
+        user_tx.send(50).await?;
+        user_tx.send(100).await?;
+        adjustment.await;
+        assert_eq!(Some(100), controller.last_brightness);
+        assert_eq!(100, prediction_rx.try_recv()?);
+        Ok(())
     }
 
     #[apply(test!)]

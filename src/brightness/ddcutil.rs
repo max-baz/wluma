@@ -1,3 +1,4 @@
+use super::{validate_limits, BackendChanged};
 use anyhow::{anyhow, Context, Result};
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use dbus::blocking::Connection;
@@ -20,6 +21,7 @@ enum Backend {
     Mock {
         current: u16,
         maximum: u16,
+        reads: u64,
     },
 }
 
@@ -38,11 +40,12 @@ impl DdcUtil {
     pub fn new(identifier: &str, min_brightness: u64) -> Result<Self> {
         match Service::new(identifier) {
             Ok((service, max_brightness)) => {
+                validate_limits(min_brightness, max_brightness as u64)?;
                 log::info!("Using ddcutil-service over D-Bus for DDC display '{identifier}'");
                 Ok(Self {
                     backend: Some(Backend::Service(service)),
                     min_brightness,
-                    max_brightness: (max_brightness as u64).max(min_brightness),
+                    max_brightness: max_brightness as u64,
                 })
             }
             Err(service_error) => {
@@ -56,13 +59,14 @@ impl DdcUtil {
                     .get_vcp_feature(DDC_BRIGHTNESS_FEATURE)
                     .context("Unable to read brightness over raw DDC")?
                     .maximum() as u64;
+                validate_limits(min_brightness, max_brightness)?;
                 log::info!(
                     "Using raw DDC for display '{identifier}' (using ddcutil-service is recommended)"
                 );
                 Ok(Self {
                     backend: Some(Backend::Raw(display)),
                     min_brightness,
-                    max_brightness: max_brightness.max(min_brightness),
+                    max_brightness,
                 })
             }
         }
@@ -71,9 +75,28 @@ impl DdcUtil {
     #[cfg(test)]
     pub(super) fn mock(current: u16, maximum: u16) -> Self {
         Self {
-            backend: Some(Backend::Mock { current, maximum }),
+            backend: Some(Backend::Mock {
+                current,
+                maximum,
+                reads: 0,
+            }),
             min_brightness: 0,
             max_brightness: maximum as u64,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn mock_set_maximum(&mut self, value: u16) {
+        if let Some(Backend::Mock { maximum, .. }) = &mut self.backend {
+            *maximum = value;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn mock_reads(&self) -> u64 {
+        match &self.backend {
+            Some(Backend::Mock { reads, .. }) => *reads,
+            _ => unreachable!(),
         }
     }
 
@@ -99,14 +122,32 @@ impl DdcUtil {
                     Ok((reply.value(), reply.maximum()))
                 }
                 #[cfg(test)]
-                Backend::Mock { current, maximum } => Ok((*current, *maximum)),
+                Backend::Mock {
+                    current,
+                    maximum,
+                    reads,
+                } => {
+                    *reads += 1;
+                    Ok((*current, *maximum))
+                }
             })
             .await?;
-        self.max_brightness = (maximum as u64).max(self.min_brightness);
+        if maximum as u64 != self.max_brightness || maximum == 0 {
+            return Err(BackendChanged(format!(
+                "DDC brightness maximum changed from {} to {maximum}",
+                self.max_brightness
+            ))
+            .into());
+        }
         Ok((value as u64).clamp(self.min_brightness, self.max_brightness))
     }
 
     pub async fn set(&mut self, value: u64) -> Result<u64> {
+        self.get().await?;
+        self.set_after_read(value).await
+    }
+
+    pub(super) async fn set_after_read(&mut self, value: u64) -> Result<u64> {
         let value = value.clamp(self.min_brightness, self.max_brightness);
         self.with_backend(move |backend| match backend {
             Backend::Service(service) => service.set_brightness(value as u16),
@@ -279,6 +320,21 @@ mod tests {
     use macro_rules_attribute::apply;
     use smol_macros::test;
     use std::time::Duration;
+
+    #[apply(test!)]
+    async fn changed_maximum_never_publishes_a_new_scale_or_writes() {
+        for maximum in [0, 255] {
+            let mut ddc = DdcUtil::mock(42, 100);
+            ddc.mock_set_maximum(maximum);
+            assert!(ddc.get().await.unwrap_err().is::<BackendChanged>());
+            assert_eq!(100, ddc.max());
+            assert!(ddc.set(99).await.unwrap_err().is::<BackendChanged>());
+            assert!(matches!(
+                ddc.backend,
+                Some(Backend::Mock { current: 42, .. })
+            ));
+        }
+    }
 
     #[apply(test!)]
     async fn blocking_operation_leaves_executor_responsive() -> Result<()> {

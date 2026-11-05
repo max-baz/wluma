@@ -9,7 +9,9 @@ use crate::{
         AlsDirection,
     },
 };
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU64;
 
 const REPLACEMENT_DISTANCE: f64 = 0.25;
 
@@ -56,21 +58,21 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(
-        prediction_tx: Sender<u64>,
-        user_rx: Receiver<u64>,
-        als_rx: Receiver<Reading>,
+        channels: (Sender<u64>, Receiver<u64>, Receiver<Reading>),
         stateful: bool,
         output_name: &str,
         scale: Scale,
         legacy_thresholds: &HashMap<u64, String>,
-    ) -> Self {
-        Self::new_kind(
-            (prediction_tx, user_rx, als_rx),
+        maximum: u64,
+    ) -> Result<Self> {
+        Self::new_inner(
+            channels,
             stateful,
             output_name,
             scale,
             legacy_thresholds,
             Kind::Brightness,
+            Some(NonZeroU64::new(maximum).context("Hardware brightness maximum must be nonzero")?),
         )
     }
 
@@ -81,15 +83,39 @@ impl Controller {
         scale: Scale,
         legacy_thresholds: &HashMap<u64, String>,
         kind: Kind,
-    ) -> Self {
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            kind != Kind::Brightness,
+            "Hardware brightness requires a maximum"
+        );
+        Self::new_inner(
+            channels,
+            stateful,
+            output_name,
+            scale,
+            legacy_thresholds,
+            kind,
+            None,
+        )
+    }
+
+    fn new_inner(
+        channels: (Sender<u64>, Receiver<u64>, Receiver<Reading>),
+        stateful: bool,
+        output_name: &str,
+        scale: Scale,
+        legacy_thresholds: &HashMap<u64, String>,
+        kind: Kind,
+        maximum: Option<NonZeroU64>,
+    ) -> Result<Self> {
         let (prediction_tx, user_rx, als_rx) = channels;
         let data = if stateful {
-            Data::load_kind(output_name, kind, legacy_thresholds, scale)
+            Data::load_kind(output_name, kind, legacy_thresholds, scale, maximum)?
         } else {
-            Data::new_kind(output_name, kind, scale, legacy_thresholds)
+            Data::new_kind(output_name, kind, scale, legacy_thresholds, maximum)
         };
 
-        Self {
+        Ok(Self {
             prediction_tx,
             user_rx,
             als_rx,
@@ -107,7 +133,7 @@ impl Controller {
             luma_direction: LumaDirection::Decreasing,
             model: None,
             kind,
-        }
+        })
     }
 
     pub fn without_initial_value(mut self) -> Self {
@@ -287,7 +313,7 @@ impl Controller {
             !nearby
         });
 
-        self.data.entries.push(pending);
+        self.data.entries.push(self.data.observe(pending));
         self.model = None;
 
         self.data
@@ -295,7 +321,12 @@ impl Controller {
             .sort_unstable_by(|x, y| x.als.cmp(&y.als).then(x.luma.cmp(&y.luma)));
 
         if self.stateful {
-            self.data.save().expect("Unable to save data");
+            if let Err(error) = self.data.save() {
+                log::error!(
+                    "Unable to save learned data for '{}': {error:#}",
+                    self.output_name
+                );
+            }
         }
     }
 
@@ -310,8 +341,9 @@ impl Controller {
     async fn predict(&mut self, als: u64, luma: u8) {
         let luma = self.luma(luma);
         if self.model.is_none() {
-            let projected = (!self.luma_aware).then(|| collapse_luma(&self.data.entries));
-            let entries = projected.as_deref().unwrap_or(&self.data.entries);
+            let raw = self.data.projected();
+            let projected = (!self.luma_aware).then(|| collapse_luma(&raw));
+            let entries = projected.as_deref().unwrap_or(&raw);
             self.model = monotonic::Model::fit(
                 entries,
                 self.scale,
@@ -350,6 +382,10 @@ mod tests {
     const ALS_BRIGHT: u64 = 30;
 
     async fn setup() -> Result<(Controller, Sender<u64>, Receiver<u64>)> {
+        setup_maximum(100).await
+    }
+
+    async fn setup_maximum(maximum: u64) -> Result<(Controller, Sender<u64>, Receiver<u64>)> {
         let (als_tx, als_rx) = channel::bounded(128);
         let (user_tx, user_rx) = channel::bounded(128);
         let (prediction_tx, prediction_rx) = channel::bounded(128);
@@ -361,15 +397,72 @@ mod tests {
             .await?;
         user_tx.send(0).await?;
         let controller = Controller::new(
-            prediction_tx,
-            user_rx,
-            als_rx,
+            (prediction_tx, user_rx, als_rx),
             false,
             "Dell 1",
             Scale::Linear,
             &HashMap::new(),
-        );
+            maximum,
+        )?;
         Ok((controller, user_tx, prediction_rx))
+    }
+
+    #[apply(test!)]
+    async fn unchanged_scale_has_identical_raw_model_predictions() -> Result<()> {
+        let entries = vec![
+            Entry::new(10, 10, 1),
+            Entry::new(20, 20, 2),
+            Entry::new(70, 70, 248),
+            Entry::new(90, 90, 100),
+        ];
+        let model = monotonic::Model::fit(
+            &entries,
+            Scale::Linear,
+            AlsDirection::Increasing,
+            LumaDirection::Decreasing,
+            true,
+        )
+        .unwrap();
+        let (mut controller, _, predictions) = setup_maximum(255).await?;
+        controller.data.entries = entries
+            .into_iter()
+            .map(|entry| controller.data.observe(entry))
+            .collect();
+        for als in (0..=100).step_by(5) {
+            for luma in (0..=100).step_by(5) {
+                controller.predict(als, luma).await;
+                assert_eq!(
+                    model.predict(als, luma).round() as u64,
+                    predictions.try_recv()?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn unrelated_stateless_learning_preserves_original_fractions() -> Result<()> {
+        let (mut original, _, _) = setup_maximum(255).await?;
+        original
+            .data
+            .entries
+            .push(original.data.observe(Entry::new(10, 20, 248)));
+        let (mut switched, _, predictions) = setup_maximum(100).await?;
+        switched.data.entries.clone_from(&original.data.entries);
+        switched.predict(10, 20).await;
+        assert_eq!(97, predictions.try_recv()?);
+        switched.pending = Some(Entry::new(90, 30, 33));
+        switched.learn();
+        original.data.entries.clone_from(&switched.data.entries);
+        assert_eq!(
+            vec![Entry::new(10, 20, 248), Entry::new(90, 30, 84)],
+            original.data.projected()
+        );
+        switched.pending = Some(Entry::new(10, 20, 98));
+        switched.learn();
+        original.data.entries.clone_from(&switched.data.entries);
+        assert_eq!(250, original.data.projected()[0].brightness);
+        Ok(())
     }
 
     #[apply(test!)]
@@ -402,7 +495,10 @@ mod tests {
     async fn can_ignore_luma_without_discarding_it() -> Result<()> {
         let (mut controller, user_tx, prediction_rx) = setup().await?;
         controller.data.entries =
-            vec![Entry::new(ALS_DIM, 10, 4000), Entry::new(ALS_DIM, 90, 5000)];
+            vec![Entry::new(ALS_DIM, 10, 4000), Entry::new(ALS_DIM, 90, 5000)]
+                .into_iter()
+                .map(|entry| controller.data.observe(entry))
+                .collect();
         controller = controller.without_initial_value().without_luma();
 
         assert_eq!(
@@ -489,7 +585,7 @@ mod tests {
     #[apply(test!)]
     async fn unstable_als_prevents_prediction() -> Result<()> {
         let (mut controller, _, prediction_rx) = setup().await?;
-        controller.data.entries = vec![Entry::new(ALS_DIM, 20, 30)];
+        controller.data.entries = vec![controller.data.observe(Entry::new(ALS_DIM, 20, 30))];
 
         controller
             .process_reading(
@@ -557,7 +653,10 @@ mod tests {
             Entry::new(21, 20, 31),
             Entry::new(10, 30, 31),
             Entry::new(30, 10, 29),
-        ];
+        ]
+        .into_iter()
+        .map(|entry| controller.data.observe(entry))
+        .collect();
         controller.pending = Some(Entry::new(ALS_DIM, 20, 30));
 
         controller.learn();
@@ -589,7 +688,7 @@ mod tests {
     #[apply(test!)]
     async fn one_observation_is_used_across_the_domain() -> Result<()> {
         let (mut controller, _, prediction_rx) = setup().await?;
-        controller.data.entries = vec![Entry::new(100, 100, 42)];
+        controller.data.entries = vec![controller.data.observe(Entry::new(100, 100, 42))];
 
         controller.predict(ALS_DIM, 20).await;
 
@@ -606,7 +705,10 @@ mod tests {
             Entry::new(1, 61, 10),
             Entry::new(503, 0, 100),
             Entry::new(1264, 18, 100),
-        ];
+        ]
+        .into_iter()
+        .map(|entry| controller.data.observe(entry))
+        .collect();
 
         controller.predict(0, 20).await;
         controller.predict(0, 47).await;

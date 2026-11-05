@@ -49,12 +49,14 @@ pub struct Controller {
     paused: Option<Arc<AtomicBool>>,
     enabled: Option<Arc<AtomicBool>>,
     additional: Vec<Controller>,
+    lifetime: Option<crate::brightness::Lifetime>,
 }
 
 impl Controller {
     pub fn adaptive(controller: adaptive::Controller) -> Self {
         Self {
             inner: Inner::Adaptive(controller),
+            lifetime: None,
             status: None,
             paused: None,
             enabled: None,
@@ -65,6 +67,7 @@ impl Controller {
     pub fn manual(controller: manual::Controller) -> Self {
         Self {
             inner: Inner::Manual(controller),
+            lifetime: None,
             status: None,
             paused: None,
             enabled: None,
@@ -93,7 +96,23 @@ impl Controller {
         self
     }
 
+    pub fn with_lifetime(mut self, lifetime: crate::brightness::Lifetime) -> Self {
+        self.lifetime = Some(lifetime);
+        self
+    }
+
     pub async fn adjust(&mut self, luma: u8) {
+        if let Some(lifetime) = self.lifetime.clone() {
+            if !lifetime.is_valid() {
+                return;
+            }
+            smol::future::or(lifetime.changed(), self.adjust_enabled(luma)).await;
+        } else {
+            self.adjust_enabled(luma).await;
+        }
+    }
+
+    async fn adjust_enabled(&mut self, luma: u8) {
         if !self.can_adjust() {
             return;
         }
@@ -121,7 +140,7 @@ impl Controller {
     fn is_enabled(&self) -> bool {
         self.enabled
             .as_ref()
-            .is_none_or(|enabled| enabled.load(Ordering::Relaxed))
+            .is_none_or(|enabled| enabled.load(Ordering::Acquire))
     }
 
     async fn adjust_inner(&mut self, luma: u8) {
@@ -181,6 +200,46 @@ fn interpolate_raw(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidation_cancels_startup_waits_without_publishing_or_learning() {
+        smol::block_on(async {
+            for have_als in [false, true] {
+                let (als_tx, als_rx) = smol::channel::bounded(1);
+                let (_user_tx, user_rx) = smol::channel::bounded(1);
+                let (prediction_tx, prediction_rx) = smol::channel::bounded(1);
+                if have_als {
+                    als_tx
+                        .send(crate::als::Reading {
+                            value: 20,
+                            stable: true,
+                        })
+                        .await
+                        .unwrap();
+                }
+                let inner = adaptive::Controller::new(
+                    (prediction_tx, user_rx, als_rx),
+                    false,
+                    "panel",
+                    Scale::Linear,
+                    &std::collections::HashMap::new(),
+                    255,
+                )
+                .unwrap();
+                let lifetime = crate::brightness::Lifetime::default();
+                let mut controller = Controller::adaptive(inner).with_lifetime(lifetime.clone());
+                let mut adjustment = Box::pin(controller.adjust(20));
+                assert!(smol::future::poll_once(adjustment.as_mut()).await.is_none());
+                lifetime.invalidate();
+                smol::future::race(adjustment, async {
+                    smol::Timer::after(Duration::from_secs(1)).await;
+                    panic!("Invalidation did not cancel startup");
+                })
+                .await;
+                assert!(prediction_rx.is_empty());
+            }
+        });
+    }
 
     #[test]
     fn interpolation_rounds_to_nearest_brightness() {

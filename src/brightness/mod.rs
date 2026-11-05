@@ -1,11 +1,60 @@
 mod backlight;
 mod controller;
 mod ddcutil;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use anyhow::Result;
 pub use backlight::Backlight;
-pub use controller::{Command, CommandAction, Controller};
+pub use controller::{Command, CommandAction, Controller, PauseState};
 pub use ddcutil::DdcUtil;
+
+#[derive(Clone)]
+pub struct Lifetime {
+    signal: smol::channel::Sender<()>,
+    changed: smol::channel::Receiver<()>,
+}
+
+impl Default for Lifetime {
+    fn default() -> Self {
+        let (signal, changed) = smol::channel::unbounded();
+        Self { signal, changed }
+    }
+}
+
+impl Lifetime {
+    pub fn invalidate(&self) {
+        self.signal.close();
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.signal.is_closed()
+    }
+
+    pub async fn changed(&self) {
+        let _ = self.changed.recv().await;
+    }
+}
+
+#[derive(Debug)]
+pub struct BackendChanged(pub String);
+
+impl std::fmt::Display for BackendChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BackendChanged {}
+
+pub fn validate_limits(minimum: u64, maximum: u64) -> Result<()> {
+    anyhow::ensure!(maximum > 0, "Hardware brightness maximum must be nonzero");
+    anyhow::ensure!(
+        minimum <= maximum,
+        "Configured brightness minimum {minimum} exceeds hardware maximum {maximum}"
+    );
+    Ok(())
+}
 
 #[allow(clippy::large_enum_variant)]
 pub enum Brightness {
@@ -27,6 +76,20 @@ pub enum Brightness {
 }
 
 impl Brightness {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Backlight(backlight) => backlight.validate(),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn set_after_read(&mut self, value: u64) -> Result<u64> {
+        match self {
+            Self::DdcUtil(ddc) => ddc.set_after_read(value).await,
+            _ => self.set(value).await,
+        }
+    }
+
     pub async fn get(&mut self) -> Result<u64> {
         match self {
             Brightness::DdcUtil(b) => b.get().await,
