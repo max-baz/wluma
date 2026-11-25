@@ -252,8 +252,13 @@ fn backlights(connectors: &[Connector]) -> Vec<Backlight> {
 }
 
 fn matches_connector(backlight: &Backlight, connector: &Connector) -> bool {
-    backlight.connector.as_deref() == Some(&connector.name)
-        || same_edid(&backlight.edid, &connector.edid)
+    // A backlight registered under a connector in sysfs belongs to it. Fall back to
+    // EDID only for backlights without that parent: identical panels (e.g. dual-screen
+    // laptops) share an EDID, so it cannot tell them apart.
+    match &backlight.connector {
+        Some(name) => name == &connector.name,
+        None => same_edid(&backlight.edid, &connector.edid),
+    }
 }
 
 fn fallback_backlight(
@@ -484,6 +489,25 @@ mod tests {
         let backlights = vec![discovered_backlight("apple-panel-bl")];
 
         assert_eq!(fallback_backlight(&connectors, &backlights), Some((0, 0)));
+    }
+
+    #[test]
+    fn sysfs_parent_wins_over_shared_edid() {
+        let edid = vec![0xab; 128];
+        let mut edp1 = connector("eDP-1");
+        edp1.edid = edid.clone();
+        let mut edp2 = connector("eDP-2");
+        edp2.edid = edid.clone();
+
+        let mut under_edp2 = discovered_backlight("card0-eDP-2-backlight");
+        under_edp2.connector = Some("eDP-2".to_string());
+        under_edp2.edid = edid.clone();
+        let mut orphan = discovered_backlight("orphan");
+        orphan.edid = edid;
+
+        assert!(!matches_connector(&under_edp2, &edp1));
+        assert!(matches_connector(&under_edp2, &edp2));
+        assert!(matches_connector(&orphan, &edp1));
     }
 
     #[test]
